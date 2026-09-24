@@ -620,9 +620,9 @@ async function clearPublishBlockers(page: Page): Promise<string[]> {
 }
 
 /**
- * Cửa sổ chia ô: Published options không hiện "Copy responder link" / Shorten URL
- * — chỉ còn icon chuỗi góc dưới trái (XuQwKc / GmuOkf / foqfDc). Bấm icon đó
- * thì mở popover Copy responder link.
+ * Published options (cửa sổ nhỏ): footer = [icon chuỗi] …… [Cancel] [Save].
+ * Icon đó mở popover Copy responder link. Không bấm icon Responders/Manage, và
+ * không leo closest('[tabindex]') lên cả dialog (sẽ click nhầm giữa hộp).
  */
 async function clickPublishedOptionsLinkIcon(page: Page): Promise<boolean> {
   await installViewportHelpers(page)
@@ -631,12 +631,18 @@ async function clickPublishedOptionsLinkIcon(page: Page): Promise<boolean> {
       .evaluate(() => {
         const vis = (el: HTMLElement): boolean => {
           const s = window.getComputedStyle(el)
-          if (s.display === 'none' || s.visibility === 'hidden') return false
+          if (s.display === 'none' || s.visibility === 'hidden' || s.pointerEvents === 'none') {
+            return false
+          }
           const r = el.getBoundingClientRect()
-          return r.width > 6 && r.height > 6
+          return r.width > 8 && r.height > 8
         }
         const norm = (s: string | null): string =>
           (s || '').replace(/\s+/g, ' ').trim().toLowerCase()
+        const isDialogEl = (el: HTMLElement): boolean => {
+          const role = (el.getAttribute('role') || '').toLowerCase()
+          return role === 'dialog' || role === 'alertdialog' || el.getAttribute('aria-modal') === 'true'
+        }
         const dialogs = (
           Array.from(
             document.querySelectorAll('[role="dialog"], [aria-modal="true"]')
@@ -657,84 +663,149 @@ async function clickPublishedOptionsLinkIcon(page: Page): Promise<boolean> {
           if (typeof w.__cmReveal === 'function') w.__cmReveal(el)
           else {
             try {
-              el.scrollIntoView({ block: 'center', inline: 'nearest' })
+              el.scrollIntoView({ block: 'nearest', inline: 'nearest' })
             } catch {
               // ignore
             }
           }
         }
-        const clickableOf = (el: HTMLElement): HTMLElement => {
-          const host =
-            (el.closest(
-              'button, [role="button"], [role="link"], [jsaction], [tabindex]'
-            ) as HTMLElement | null) || el
-          return vis(host) ? host : el
+        const iconHost = (el: HTMLElement, dialog: HTMLElement): HTMLElement => {
+          let n: HTMLElement | null = el
+          let best = el
+          while (n && n !== dialog && n !== document.body) {
+            if (isDialogEl(n)) break
+            const r = n.getBoundingClientRect()
+            const role = (n.getAttribute('role') || '').toLowerCase()
+            if (r.width >= 16 && r.width <= 56 && r.height >= 16 && r.height <= 56) {
+              best = n
+              if (n.tagName === 'BUTTON' || role === 'button' || role === 'link') return n
+            }
+            if (r.width > 72 || r.height > 72) break
+            n = n.parentElement
+          }
+          return best
         }
         const pointOf = (el: HTMLElement): { x: number; y: number } | null => {
           reveal(el)
           const r = el.getBoundingClientRect()
-          if (r.width < 6 || r.height < 6) return null
-          if (r.bottom < 0 || r.top > window.innerHeight) return null
+          if (r.width < 8 || r.height < 8 || r.width > 72 || r.height > 72) return null
+          if (r.bottom < 4 || r.top > window.innerHeight - 4) return null
           return { x: r.left + r.width / 2, y: r.top + r.height / 2 }
         }
-        const isCancelOrSave = (el: HTMLElement): boolean => {
+        const isCancelSave = (el: HTMLElement): boolean => {
           const t = norm(el.innerText || el.getAttribute('aria-label'))
-          return ['cancel', 'huỷ', 'hủy', 'save', 'lưu'].includes(t)
+          return ['cancel', 'huỷ', 'hủy', 'save', 'lưu', 'done', 'xong'].includes(t)
+        }
+        const isBlockedLabel = (t: string): boolean =>
+          /manage|quản lý|cancel|huỷ|hủy|save|lưu|responders|người trả lời|anyone with the link|close date|response limit|published options/.test(
+            t
+          )
+        const ariaOf = (el: HTMLElement): string =>
+          norm(
+            `${el.getAttribute('aria-label') || ''} ${el.getAttribute('data-tooltip') || ''} ${el.getAttribute('title') || ''} ${el.getAttribute('aria-description') || ''}`
+          )
+        const ligatureOf = (el: HTMLElement): string => {
+          const bits: string[] = []
+          for (const n of Array.from(el.childNodes)) {
+            if (n.nodeType === Node.TEXT_NODE) bits.push((n.textContent || '').trim())
+          }
+          const own = bits.join(' ').trim().toLowerCase()
+          if (own) return own
+          if (el.childElementCount === 0) return (el.textContent || '').trim().toLowerCase()
+          return ''
         }
 
         for (const d of dialogs) {
-          const byClass = Array.from(
-            d.querySelectorAll('.XuQwKc, .GmuOkf, .foqfDc, .gdyQ3c')
-          ) as HTMLElement[]
-          for (const el of byClass) {
-            if (!vis(el)) continue
-            const hit = clickableOf(el)
-            if (isCancelOrSave(hit)) continue
-            const p = pointOf(hit)
-            if (p) return p
-          }
-
-          const byAria = (
-            Array.from(
-              d.querySelectorAll(
-                'button, [role="button"], [role="link"], [aria-label], [data-tooltip]'
-              )
-            ) as HTMLElement[]
-          ).find((el) => {
-            if (!vis(el) || isCancelOrSave(el)) return false
-            const lab = `${el.getAttribute('aria-label') || ''} ${el.getAttribute('data-tooltip') || ''} ${el.getAttribute('title') || ''}`
-            return /copy responder|copy link|get link|share|chia sẻ|liên kết|responder link/i.test(
-              lab
-            )
-          })
-          if (byAria) {
-            const p = pointOf(clickableOf(byAria))
-            if (p) return p
-          }
-
-          // Cùng hàng Cancel | Save: nút icon bên trái (không chữ)
-          const footerBtns = (
-            Array.from(
-              d.querySelectorAll('button, [role="button"], .XuQwKc')
-            ) as HTMLElement[]
-          ).filter((el) => vis(el) && !isCancelOrSave(el))
-          const cancel = (
+          const actions = (
             Array.from(d.querySelectorAll('button, [role="button"]')) as HTMLElement[]
-          ).find((el) => vis(el) && ['cancel', 'huỷ', 'hủy'].includes(norm(el.innerText)))
-          if (cancel) {
-            const cr = cancel.getBoundingClientRect()
-            const leftOfCancel = footerBtns
-              .map((el) => ({ el, r: el.getBoundingClientRect() }))
-              .filter(
-                ({ r }) =>
-                  r.right < cr.left - 4 &&
-                  Math.abs(r.top + r.height / 2 - (cr.top + cr.height / 2)) < 28
-              )
-              .sort((a, b) => a.r.left - b.r.left)
-            if (leftOfCancel[0]) {
-              const p = pointOf(clickableOf(leftOfCancel[0].el))
-              if (p) return p
+          ).filter(vis)
+          const cancel =
+            actions.find((el) => ['cancel', 'huỷ', 'hủy'].includes(norm(el.innerText))) || null
+          const save = actions.find((el) => ['save', 'lưu'].includes(norm(el.innerText))) || null
+          const footer = cancel || save
+          if (footer) reveal(footer)
+          const fr = footer?.getBoundingClientRect()
+
+          type Cand = { el: HTMLElement; score: number }
+          const scored: Cand[] = []
+          const add = (raw: HTMLElement, extra: number): void => {
+            if (!vis(raw) || isCancelSave(raw)) return
+            const el = iconHost(raw, d)
+            if (!vis(el) || isCancelSave(el)) return
+            const r = el.getBoundingClientRect()
+            if (r.width > 56 || r.height > 56 || r.width < 16 || r.height < 16) return
+            const lab = `${ariaOf(el)} ${norm(el.innerText)} ${ligatureOf(el)}`
+            if (
+              isBlockedLabel(lab) &&
+              !/copy responder|copy link|get link|liên kết|responder link/.test(lab)
+            ) {
+              return
             }
+            let score = extra
+            if (
+              /copy responder|copy link|get link|responder link|sao chép liên kết|insert_link|^link$/.test(
+                lab
+              )
+            ) {
+              score += 8
+            }
+            if (['link', 'insert_link', 'add_link'].includes(ligatureOf(el))) score += 10
+            if (fr) {
+              const sameRow = Math.abs(r.top + r.height / 2 - (fr.top + fr.height / 2)) < 26
+              if (sameRow && r.right < fr.left - 2) score += 6
+              else if (sameRow) score += 1
+              else score -= 4
+            }
+            scored.push({ el, score })
+          }
+
+          for (const el of Array.from(
+            d.querySelectorAll(
+              '.google-material-icons, .material-icons, .material-symbols-outlined, .material-symbols-rounded, i, span'
+            )
+          ) as HTMLElement[]) {
+            const lig = ligatureOf(el)
+            if (['link', 'insert_link', 'add_link', 'link_off'].includes(lig)) add(el, 12)
+          }
+
+          for (const el of Array.from(
+            d.querySelectorAll(
+              'button, [role="button"], [role="link"], [aria-label], [data-tooltip], [title]'
+            )
+          ) as HTMLElement[]) {
+            const lab = ariaOf(el)
+            if (
+              /copy responder|copy link|get link|share link|responder link|chia sẻ liên kết|sao chép liên kết|liên kết người trả lời/.test(
+                lab
+              )
+            ) {
+              add(el, 9)
+            }
+          }
+
+          if (fr) {
+            const nodes = Array.from(
+              d.querySelectorAll('button, [role="button"], [role="link"], [jsaction], div, span, a')
+            ) as HTMLElement[]
+            for (const el of nodes) {
+              if (!vis(el) || isCancelSave(el)) continue
+              const r = el.getBoundingClientRect()
+              if (r.width < 18 || r.width > 48 || r.height < 18 || r.height > 48) continue
+              if (Math.abs(r.top + r.height / 2 - (fr.top + fr.height / 2)) > 22) continue
+              if (r.right >= fr.left - 2) continue
+              const text = norm(el.innerText)
+              if (text && text.length > 2 && !['link', 'insert_link'].includes(text)) continue
+              add(el, 5)
+            }
+          }
+
+          scored.sort((a, b) => b.score - a.score)
+          const seen = new Set<HTMLElement>()
+          for (const { el, score } of scored) {
+            if (score < 5 || seen.has(el)) continue
+            seen.add(el)
+            const p = pointOf(el)
+            if (p) return p
           }
         }
         return null
@@ -744,53 +815,82 @@ async function clickPublishedOptionsLinkIcon(page: Page): Promise<boolean> {
     const abs = await framePointToPage(page, frame, point)
     if (await mouseClickPoint(page, abs)) return true
     const viaDom = await frame
-      .evaluate(() => {
-        const vis = (el: HTMLElement): boolean => {
-          const s = window.getComputedStyle(el)
-          if (s.display === 'none' || s.visibility === 'hidden') return false
-          const r = el.getBoundingClientRect()
-          return r.width > 6 && r.height > 6
-        }
-        const dialogs = (
-          Array.from(
-            document.querySelectorAll('[role="dialog"], [aria-modal="true"]')
-          ) as HTMLElement[]
-        ).filter((d) => vis(d) && /published options|anyone with the link/i.test(d.innerText || ''))
-        const fire = (el: HTMLElement): boolean => {
-          const host =
-            (el.closest('button, [role="button"], [role="link"], [jsaction]') as HTMLElement | null) ||
-            el
-          host.dispatchEvent(
-            new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window, button: 0 })
-          )
-          host.dispatchEvent(
-            new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window, button: 0 })
-          )
-          host.click()
+      .evaluate(
+        (x: number, y: number) => {
+          const el = document.elementFromPoint(x, y) as HTMLElement | null
+          if (!el) return false
+          let host: HTMLElement | null = el
+          while (host && host !== document.body) {
+            const role = (host.getAttribute('role') || '').toLowerCase()
+            if (role === 'dialog' || role === 'alertdialog') break
+            const r = host.getBoundingClientRect()
+            if (
+              (host.tagName === 'BUTTON' || role === 'button') &&
+              r.width <= 56 &&
+              r.height <= 56
+            ) {
+              break
+            }
+            if (r.width > 72 || r.height > 72) {
+              host = el
+              break
+            }
+            host = host.parentElement
+          }
+          const target = host || el
+          for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click'] as const) {
+            target.dispatchEvent(
+              new MouseEvent(type, { bubbles: true, cancelable: true, view: window, button: 0 })
+            )
+          }
+          target.click()
           return true
-        }
-        for (const d of dialogs) {
-          const el = d.querySelector('.XuQwKc, .foqfDc, .GmuOkf') as HTMLElement | null
-          if (el && vis(el)) return fire(el)
-        }
-        return false
-      })
+        },
+        point.x,
+        point.y
+      )
       .catch(() => false)
     if (viaDom) return true
   }
   return false
 }
 
-/** Published options đang mở → bấm icon chuỗi (nếu có) rồi chờ popover Copy. */
+/** Published options đang mở → bấm icon chuỗi góc dưới trái rồi chờ popover Copy. */
 async function tryOpenCopyPanelFromPublishedOptions(page: Page): Promise<boolean> {
   if (await hasCopyResponderLinkDialog(page)) return true
   if (!(await hasPublishedOptionsDialog(page))) return false
   await page.bringToFront().catch(() => undefined)
-  await revealResponderCopySection(page)
+  // Đưa hàng Cancel|Save (và icon chuỗi) vào viewport — không lăn mất footer
+  for (const frame of framesOf(page)) {
+    await frame
+      .evaluate(() => {
+        const vis = (el: HTMLElement): boolean => {
+          const r = el.getBoundingClientRect()
+          const s = window.getComputedStyle(el)
+          return r.width > 8 && r.height > 8 && s.display !== 'none' && s.visibility !== 'hidden'
+        }
+        const dialogs = (
+          Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]')) as HTMLElement[]
+        ).filter((d) => vis(d) && /published options|anyone with the link/i.test(d.innerText || ''))
+        for (const d of dialogs) {
+          const cancel = (
+            Array.from(d.querySelectorAll('button, [role="button"]')) as HTMLElement[]
+          ).find((el) => vis(el) && /^(cancel|huỷ|hủy)$/i.test((el.innerText || '').trim()))
+          if (cancel) {
+            try {
+              cancel.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+            } catch {
+              // ignore
+            }
+          }
+        }
+      })
+      .catch(() => undefined)
+  }
   if (await hasCopyResponderLinkDialog(page)) return true
   if (!(await clickPublishedOptionsLinkIcon(page))) return false
   const started = Date.now()
-  while (Date.now() - started < 3500) {
+  while (Date.now() - started < 4000) {
     await delay(250)
     if (await hasCopyResponderLinkDialog(page)) return true
   }
@@ -1039,11 +1139,46 @@ async function dumpFormDialogs(page: Page): Promise<string> {
           )
         ]
         const xu = document.querySelectorAll('.XuQwKc, .foqfDc').length
-        if (!dialogs.length && !btns.length && xu === 0) return ''
+        const footerBits: string[] = []
+        const pub = (
+          Array.from(
+            document.querySelectorAll('[role="dialog"], [aria-modal="true"]')
+          ) as HTMLElement[]
+        ).find((el) => vis(el) && /published options|anyone with the link/i.test(el.innerText || ''))
+        if (pub) {
+          const cancel = (
+            Array.from(pub.querySelectorAll('button, [role="button"]')) as HTMLElement[]
+          ).find((el) => vis(el) && /^(cancel|huỷ|hủy)$/i.test((el.innerText || '').trim()))
+          if (cancel) {
+            const cr = cancel.getBoundingClientRect()
+            const icons = (
+              Array.from(pub.querySelectorAll('button, [role="button"], [jsaction]')) as HTMLElement[]
+            )
+              .filter((el) => {
+                if (!vis(el)) return false
+                const r = el.getBoundingClientRect()
+                return (
+                  r.width <= 48 &&
+                  r.height <= 48 &&
+                  r.width >= 16 &&
+                  Math.abs(r.top + r.height / 2 - (cr.top + cr.height / 2)) < 24 &&
+                  r.right < cr.left - 2
+                )
+              })
+              .map((el) => {
+                const r = el.getBoundingClientRect()
+                const lab = short(el.getAttribute('aria-label') || el.innerText || 'icon', 24)
+                return `${lab}@${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}`
+              })
+            if (icons.length) footerBits.push(`chuỗi[${icons.join(';')}]`)
+          }
+        }
+        if (!dialogs.length && !btns.length && xu === 0 && !footerBits.length) return ''
         return [
           `vp=${window.innerWidth}x${window.innerHeight}`,
           ...dialogs,
           xu ? `iconLink=${xu}` : '',
+          ...footerBits,
           btns.length ? `nút[${btns.join(',')}]` : ''
         ]
           .filter(Boolean)
