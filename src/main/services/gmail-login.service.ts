@@ -1,9 +1,9 @@
 import { AsyncLocalStorage } from 'async_hooks'
-import { appendFileSync, mkdirSync } from 'fs'
 import { join } from 'path'
 import { BrowserWindow } from 'electron'
 import type { Browser, Frame, Page, ElementHandle, Target } from 'puppeteer-core'
 import { getDb } from '../db/database'
+import { pacedMs } from './step-pace'
 import {
   getGmailColumn3,
   hasGmailCredentials,
@@ -20,6 +20,7 @@ import type {
   GmailLoginResult
 } from '../../shared/types'
 import { applyWindowBounds, getDebugPort, launchProfile } from './chrome.service'
+import { appendRotatingLog } from '../utils/data-retention'
 import { getDataRoot } from '../utils/paths'
 
 interface LoginLogContext {
@@ -107,12 +108,10 @@ function loginDebugLog(message: string, extra?: unknown): void {
   try {
     const ctx = loginLogContext.getStore()
     const tag = ctx ? `[${ctx.profileName}|${ctx.email}] ` : ''
-    const dir = getDataRoot()
-    mkdirSync(dir, { recursive: true })
     const line =
       `[${new Date().toISOString()}] ${tag}${message}` +
       (extra === undefined ? '' : ` ${typeof extra === 'string' ? extra : JSON.stringify(extra)}`)
-    appendFileSync(join(dir, 'gmail-login-debug.log'), line + '\n', 'utf8')
+    appendRotatingLog(join(getDataRoot(), 'gmail-login-debug.log'), line)
   } catch {
     // ignore
   }
@@ -155,7 +154,7 @@ async function generateTotp(secret: string): Promise<string> {
 }
 
 async function delay(ms: number): Promise<void> {
-  await new Promise((r) => setTimeout(r, ms))
+  await new Promise((r) => setTimeout(r, pacedMs(ms)))
 }
 
 async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
@@ -2361,12 +2360,22 @@ export async function loginGmailForProfile(
     const formTitle = (options?.formTitle ?? savedSetup.formTitle ?? '').trim()
     const formDescription = (options?.formDescription ?? savedSetup.formDescription ?? '').trim()
     const formHeaderPath = (options?.formHeaderPath ?? savedSetup.formHeaderPath ?? '').trim()
+    const formLinkEnabled =
+      options?.formLinkEnabled !== undefined
+        ? Boolean(options.formLinkEnabled)
+        : savedSetup.formLinkEnabled !== false
     const formLinkStyle =
       options?.formLinkStyle === 'long' || options?.formLinkStyle === 'short'
         ? options.formLinkStyle
         : savedSetup.formLinkStyle === 'long'
           ? 'long'
           : 'short'
+    const drivePdfEnabled =
+      options?.drivePdfEnabled !== undefined
+        ? Boolean(options.drivePdfEnabled)
+        : Boolean(savedSetup.drivePdfEnabled)
+    const drivePdfPath = (options?.drivePdfPath ?? savedSetup.drivePdfPath ?? '').trim()
+    const drivePdfLane = Number(options?.drivePdfLane) || 0
 
     // Login + post-setup chạy song song giữa các luồng (clipboard Copy vẫn khóa từng thao tác)
     keepExtraTabs = true
@@ -2386,7 +2395,7 @@ export async function loginGmailForProfile(
 
     if (shouldPostSetup) {
       keepExtraTabs = true
-      emitLoginProgress('Bắt đầu post-setup (avatar → Form/Publish → Sheet → ô Menus → Apps Script)')
+      emitLoginProgress('Bắt đầu post-setup (avatar → Form/Publish → Drive PDF → Sheet → ô Menus → Apps Script)')
       try {
         const steps = await withTimeout(
           runPostLoginSetup(
@@ -2401,7 +2410,11 @@ export async function loginGmailForProfile(
               formTitle,
               formDescription,
               formHeaderPath: formHeaderPath || undefined,
-              formLinkStyle
+              formLinkEnabled,
+              formLinkStyle,
+              drivePdfEnabled,
+              drivePdfLane,
+              drivePdfPath: drivePdfPath || undefined
             },
             (step) => {
               emitLoginProgress(
@@ -2410,8 +2423,8 @@ export async function loginGmailForProfile(
               )
             }
           ),
-          12 * 60 * 1000,
-          'Post-setup quá thời gian (12 phút) — login vẫn giữ'
+          15 * 60 * 1000,
+          'Post-setup quá thời gian (15 phút) — login vẫn giữ'
         )
         postSetupNote = [postSetupNote, formatPostSetupSummary(steps)].filter(Boolean).join(' · ')
       } catch (error) {

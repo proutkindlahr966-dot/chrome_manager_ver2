@@ -80,3 +80,4 @@ chrome_manager/
 - Cần cài Google Chrome (hoặc chỉ đường dẫn trong Cài đặt).
 - File cũ ở root (`gmail-list.txt`, `chrome-profiles/`, …) được migrate tự động sang `data/` khi mở app.
 "# chrome_manager" 
+"# chrome_manager_ver2" 

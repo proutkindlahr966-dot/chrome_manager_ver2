@@ -9,7 +9,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { basename, extname, isAbsolute, join, resolve } from 'path'
 import type { Browser, ElementHandle, Frame, Page } from 'puppeteer-core'
+import { pruneDebugScreenshots } from '../utils/data-retention'
 import { getDebugScreenshotsDir } from '../utils/paths'
+import { pacedMs } from './step-pace'
 
 const PERSONAL_INFO_URL = 'https://myaccount.google.com/personal-info'
 
@@ -124,7 +126,7 @@ export interface AvatarChangeResult {
 
 
 function delay(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms))
+  return new Promise((r) => setTimeout(r, pacedMs(ms)))
 }
 
 function framesOf(page: Page): Frame[] {
@@ -206,9 +208,10 @@ async function saveScreenshot(page: Page, tag: string): Promise<string> {
   const dir = getDebugScreenshotsDir()
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
   const safe = tag.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 40)
-  const filePath = join(dir, `avatar-${Date.now()}-${safe}.png`)
+  const filePath = join(dir, `avatar-${Date.now()}-${safe}.jpg`)
   try {
-    writeFileSync(filePath, await page.screenshot({ fullPage: true, type: 'png' }))
+    // JPEG thay PNG: ảnh chẩn đoán chỉ cần đọc được chữ, nhẹ hơn ~5 lần.
+    writeFileSync(filePath, await page.screenshot({ fullPage: true, type: 'jpeg', quality: 60 }))
     return filePath
   } catch (error) {
     const fallback = join(dir, `avatar-${Date.now()}-${safe}.txt`)
@@ -217,6 +220,8 @@ async function saveScreenshot(page: Page, tag: string): Promise<string> {
       `${error instanceof Error ? error.message : String(error)}\nURL=${page.url()}`
     )
     return fallback
+  } finally {
+    pruneDebugScreenshots()
   }
 }
 

@@ -1,4 +1,6 @@
-import { ipcMain } from 'electron'
+import { ipcMain, app, shell } from 'electron'
+import { dirname, resolve } from 'path'
+import { copyFileSync, mkdirSync } from 'fs'
 import { IPC } from '../../shared/ipc'
 import {
   CreateGroupInput,
@@ -23,14 +25,21 @@ import {
   stopProfile
 } from './chrome.service'
 import { hasGmailCredentials } from '../../shared/gmail'
+import { hasProxy } from '../../shared/proxy'
 import {
   buildExportPayload,
   formatExportJson,
   parseImportGroupsJson
 } from '../../shared/group-import'
 import type { GmailLoginOptions, ImagePreview } from '../../shared/types'
-import { isAllowedImagePath, safeBasename } from '../utils/path-guard'
+import { isAllowedImagePath, isPathInside, safeBasename } from '../utils/path-guard'
 import { sanitizeDashboardStats } from '../utils/profile-sanitize'
+import { collectProfilesRoots } from '../../shared/profile-roots'
+import { getDataRoot } from '../utils/paths'
+import { readDiskSpace } from '../utils/disk-space'
+import type { DiskSpaceInfo } from '../../shared/disk'
+import { createTimestampedBackup, getBackupDir, listBackups, pruneOldBackups } from '../utils/db-backup'
+import { checkAppUpdates, downloadAndInstallUpdate } from './app-update'
 
 function applyFilters(profiles: ChromeProfile[], filters?: ProfileFilters): ChromeProfile[] {
   let result = [...profiles]
@@ -57,6 +66,12 @@ function applyFilters(profiles: ChromeProfile[], filters?: ProfileFilters): Chro
 
   if (filters?.status && filters.status !== 'all') {
     result = result.filter((p) => p.status === filters.status)
+  }
+
+  if (filters?.proxy === 'with') {
+    result = result.filter((p) => hasProxy(p.proxy))
+  } else if (filters?.proxy === 'without') {
+    result = result.filter((p) => !hasProxy(p.proxy))
   }
 
   const sortBy = filters?.sortBy ?? 'name'
@@ -91,13 +106,19 @@ export function registerIpcHandlers(): void {
   )
 
   ipcMain.handle(IPC.PROFILES_DELETE, async (_e, id: string) => {
-    await stopProfile(id)
+    const stopped = await stopProfile(id)
+    if (!stopped.success) {
+      throw new Error(stopped.error ?? 'Không thể đóng Chrome trước khi xóa')
+    }
     db.deleteProfile(id)
     return true
   })
 
   ipcMain.handle(IPC.PROFILES_RESET, async (_e, id: string) => {
-    await stopProfile(id)
+    const stopped = await stopProfile(id)
+    if (!stopped.success) {
+      throw new Error(stopped.error ?? 'Không thể đóng Chrome trước khi xóa sạch')
+    }
     // Windows: chờ Chrome nhả khóa file trong user-data-dir
     await new Promise((r) => setTimeout(r, 600))
     return db.resetProfile(id)
@@ -108,10 +129,14 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IPC.PROFILES_BULK_DELETE, async (_e, ids: string[]) => {
     const successIds: string[] = []
     const failed: Array<{ id: string; error: string }> = []
-    for (const id of ids) {
+    const list = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string' && id.length > 0) : []
+    for (const id of list) {
       try {
-        await stopProfile(id)
-        db.deleteProfile(id)
+        const stopped = await stopProfile(id)
+        if (!stopped.success) {
+          failed.push({ id, error: stopped.error ?? 'Không thể đóng Chrome trước khi xóa' })
+          continue
+        }
         successIds.push(id)
       } catch (error) {
         failed.push({
@@ -120,27 +145,12 @@ export function registerIpcHandlers(): void {
         })
       }
     }
+    if (successIds.length > 0) db.deleteProfiles(successIds)
     return { successIds, failed }
   })
 
-  ipcMain.handle(
-    IPC.PROFILES_BULK_UPDATE,
-    (_e, ids: string[], input: UpdateProfileInput) => {
-      const successIds: string[] = []
-      const failed: Array<{ id: string; error: string }> = []
-      for (const id of ids) {
-        try {
-          db.updateProfile(id, input)
-          successIds.push(id)
-        } catch (error) {
-          failed.push({
-            id,
-            error: error instanceof Error ? error.message : 'Không thể cập nhật'
-          })
-        }
-      }
-      return { successIds, failed }
-    }
+  ipcMain.handle(IPC.PROFILES_BULK_UPDATE, (_e, ids: string[], input: UpdateProfileInput) =>
+    db.updateProfiles(ids, input)
   )
 
   ipcMain.handle(IPC.PROFILES_LAUNCH, async (_e, id: string) => {
@@ -192,6 +202,10 @@ export function registerIpcHandlers(): void {
     const { saveGmailSetup } = await import('./gmail-list.service')
     return saveGmailSetup(config)
   })
+  ipcMain.handle(IPC.GMAIL_DRIVE_PDF_LANES, async () => {
+    const { listDrivePdfLanes } = await import('./gmail-post-setup.service')
+    return listDrivePdfLanes()
+  })
   ipcMain.handle(IPC.DIALOG_OPEN_IMAGE, async () => {
     const { dialog, BrowserWindow } = await import('electron')
     const win = BrowserWindow.getFocusedWindow()
@@ -210,6 +224,19 @@ export function registerIpcHandlers(): void {
             { name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif'] }
           ]
         })
+    if (result.canceled || !result.filePaths[0]) return null
+    return result.filePaths[0]
+  })
+
+  ipcMain.handle(IPC.DIALOG_OPEN_PDF, async () => {
+    const { dialog, BrowserWindow } = await import('electron')
+    const win = BrowserWindow.getFocusedWindow()
+    const options = {
+      title: 'Chọn file PDF',
+      properties: ['openFile'] as 'openFile'[],
+      filters: [{ name: 'PDF', extensions: ['pdf'] }]
+    }
+    const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
     if (result.canceled || !result.filePaths[0]) return null
     return result.filePaths[0]
   })
@@ -272,8 +299,15 @@ export function registerIpcHandlers(): void {
   )
   ipcMain.handle(IPC.GROUPS_DELETE, async (_e, id: string) => {
     const profiles = db.listProfiles().filter((p) => p.groupId === id)
+    const blocked: string[] = []
     for (const profile of profiles) {
-      await stopProfile(profile.id)
+      const stopped = await stopProfile(profile.id)
+      if (!stopped.success) blocked.push(profile.name || profile.id)
+    }
+    if (blocked.length > 0) {
+      throw new Error(
+        `Không đóng được Chrome của: ${blocked.slice(0, 3).join(', ')}. Nhóm chưa bị xóa.`
+      )
     }
     db.deleteGroup(id)
     return true
@@ -361,7 +395,20 @@ export function registerIpcHandlers(): void {
     db.importFromDataPath(typeof selectedPath === 'string' ? selectedPath : '', options ?? {})
   )
 
-  ipcMain.handle(IPC.DASHBOARD_STATS, (): DashboardStats => {
+function isLocalToday(iso: string | null | undefined): boolean {
+  if (!iso) return false
+  const at = new Date(iso)
+  if (Number.isNaN(at.getTime())) return false
+  const now = new Date()
+  return (
+    at.getFullYear() === now.getFullYear() &&
+    at.getMonth() === now.getMonth() &&
+    at.getDate() === now.getDate()
+  )
+}
+
+ipcMain.handle(IPC.DASHBOARD_STATS, (): DashboardStats => {
+    db.rememberUsageFromLastLaunch()
     const profiles = db.listProfiles()
     const groups = db.listGroups()
     const groupMap = new Map(groups.map((g) => [g.id, g.name]))
@@ -370,6 +417,7 @@ export function registerIpcHandlers(): void {
     let withGmail = 0
     let withProxy = 0
     let runningProfiles = 0
+    let ranToday = 0
     let idleProfiles = 0
     let errorProfiles = 0
     let startingOrStopping = 0
@@ -377,12 +425,15 @@ export function registerIpcHandlers(): void {
     for (const p of profiles) {
       const hasMail = hasGmailCredentials(p.gmail)
       if (hasMail) withGmail += 1
-      if (p.proxy?.type && p.proxy.type !== 'none') withProxy += 1
+      if (hasProxy(p.proxy)) withProxy += 1
 
       if (p.status === 'running') runningProfiles += 1
       else if (p.status === 'idle') idleProfiles += 1
       else if (p.status === 'error') errorProfiles += 1
       else if (p.status === 'starting' || p.status === 'stopping') startingOrStopping += 1
+
+      const openNow = p.status === 'running' || p.status === 'starting' || p.status === 'stopping'
+      if (openNow || isLocalToday(p.lastLaunchedAt)) ranToday += 1
 
       const bucket = groupBreakdownMap.get(p.groupId) ?? { count: 0, withGmail: 0 }
       bucket.count += 1
@@ -393,6 +444,8 @@ export function registerIpcHandlers(): void {
     return sanitizeDashboardStats({
       totalProfiles: profiles.length,
       runningProfiles,
+      ranToday,
+      ranYesterday: db.countProfilesUsedOn(1),
       idleProfiles,
       totalGroups: groups.length,
       withGmail,
@@ -421,5 +474,187 @@ export function registerIpcHandlers(): void {
     const path = detectChromePath()
     if (path) db.updateSettings({ chromePath: path })
     return path
+  })
+  ipcMain.handle(IPC.SETTINGS_PICK_PROFILES_DIR, async () => {
+    const { dialog, BrowserWindow } = await import('electron')
+    const win = BrowserWindow.getFocusedWindow()
+    const opts = {
+      title: 'Chọn thư mục lưu hồ sơ Chrome',
+      properties: ['openDirectory', 'createDirectory'] as ('openDirectory' | 'createDirectory')[]
+    }
+    const result = win
+      ? await dialog.showOpenDialog(win, opts)
+      : await dialog.showOpenDialog(opts)
+    if (result.canceled || !result.filePaths[0]) return null
+    return result.filePaths[0]
+  })
+
+  ipcMain.handle(IPC.SETTINGS_DISK_SPACE, (_e, paths?: string[]): DiskSpaceInfo[] => {
+    const settings = db.getSettings()
+    const list =
+      Array.isArray(paths) && paths.length > 0
+        ? paths
+        : collectProfilesRoots(settings)
+    return list.filter((p): p is string => typeof p === 'string' && Boolean(p.trim())).map((p) =>
+      readDiskSpace(p)
+    )
+  })
+
+  ipcMain.handle(IPC.SETTINGS_OPEN_PATH, async (_e, targetPath: string) => {
+    const raw = typeof targetPath === 'string' ? targetPath.trim() : ''
+    if (!raw) return { ok: false as const, error: 'Thiếu đường dẫn' }
+    const target = resolve(raw)
+    const settings = db.getSettings()
+    const allowed = [
+      ...collectProfilesRoots(settings),
+      getDataRoot(),
+      getBackupDir(),
+      settings.chromePath ? dirname(settings.chromePath) : '',
+      ...db.listProfiles().map((p) => p.dataDir)
+    ].filter(Boolean)
+    const allowedOpen = allowed.some((root) => {
+      const resolvedRoot = resolve(root)
+      return target === resolvedRoot || isPathInside(target, resolvedRoot)
+    })
+    if (!allowedOpen) return { ok: false as const, error: 'Không được mở đường dẫn này' }
+    const err = await shell.openPath(target)
+    if (err) return { ok: false as const, error: err }
+    return { ok: true as const }
+  })
+
+  ipcMain.handle(IPC.APP_INFO, () => {
+    const backupDir = getBackupDir()
+    mkdirSync(backupDir, { recursive: true })
+    return {
+      name: app.getName(),
+      version: app.getVersion(),
+      packaged: app.isPackaged,
+      backupDir
+    }
+  })
+
+  ipcMain.handle(IPC.APP_CHECK_UPDATES, (_e, feedUrl?: string) => checkAppUpdates(feedUrl))
+  ipcMain.handle(IPC.APP_INSTALL_UPDATE, (_e, feedUrl?: string) =>
+    downloadAndInstallUpdate(feedUrl)
+  )
+
+  ipcMain.handle(IPC.DATA_BACKUP_LIST, () => listBackups())
+
+  ipcMain.handle(IPC.DATA_BACKUP_EXPORT, async () => {
+    db.flush()
+    const source = db.getStoreFilePath()
+    const { dialog, BrowserWindow } = await import('electron')
+    const win = BrowserWindow.getFocusedWindow()
+    const opts = {
+      title: 'Sao lưu dữ liệu Chrome Manager',
+      defaultPath: 'chrome-manager-db-backup.json',
+      filters: [{ name: 'JSON', extensions: ['json'] }]
+    }
+    const result = win
+      ? await dialog.showSaveDialog(win, opts)
+      : await dialog.showSaveDialog(opts)
+    if (result.canceled || !result.filePath) return null
+    copyFileSync(source, result.filePath)
+    return result.filePath
+  })
+
+  ipcMain.handle(IPC.DATA_BACKUP_RESTORE, async () => {
+    const { dialog, BrowserWindow } = await import('electron')
+    const win = BrowserWindow.getFocusedWindow()
+    const opts = {
+      title: 'Khôi phục từ file sao lưu',
+      properties: ['openFile'] as ('openFile')[],
+      filters: [{ name: 'JSON', extensions: ['json'] }]
+    }
+    const result = win
+      ? await dialog.showOpenDialog(win, opts)
+      : await dialog.showOpenDialog(opts)
+    if (result.canceled || !result.filePaths[0]) return null
+    db.flush()
+    createTimestampedBackup(db.getStoreFilePath(), { prune: false })
+    const restored = db.replaceFromBackup(result.filePaths[0])
+    pruneOldBackups()
+    return restored
+  })
+
+  ipcMain.handle(IPC.DATA_BACKUP_RESTORE_FILE, (_e, filePath: string) => {
+    const raw = typeof filePath === 'string' ? filePath.trim() : ''
+    if (!raw) throw new Error('Thiếu đường dẫn sao lưu')
+    const target = resolve(raw)
+    if (!isPathInside(target, getBackupDir()) && target !== resolve(getBackupDir())) {
+      throw new Error('Chỉ khôi phục file trong thư mục sao lưu của app')
+    }
+    db.flush()
+    createTimestampedBackup(db.getStoreFilePath(), { prune: false })
+    const restored = db.replaceFromBackup(target)
+    pruneOldBackups()
+    return restored
+  })
+
+  ipcMain.handle(IPC.WEB_LINKS_LOAD, async () => {
+    const { loadWebLinks } = await import('./web-link-check.service')
+    return loadWebLinks()
+  })
+  ipcMain.handle(IPC.WEB_LINKS_SAVE, async (_e, content: string) => {
+    const { saveWebLinks } = await import('./web-link-check.service')
+    return saveWebLinks(typeof content === 'string' ? content : '')
+  })
+  ipcMain.handle(IPC.WEB_LINKS_CHECK, async (_e, content: string, target?: 'web' | 'form') => {
+    const { checkWebLinks } = await import('./web-link-check.service')
+    const kind = target === 'form' ? 'form' : 'web'
+    return checkWebLinks(typeof content === 'string' ? content : '', kind)
+  })
+  ipcMain.handle(IPC.WEB_LINKS_CHECK_LIST, async (_e, content: string, target?: 'all' | 'web' | 'form') => {
+    const { checkUrlList } = await import('./web-link-check.service')
+    const scope = target === 'web' || target === 'form' ? target : 'all'
+    return checkUrlList(typeof content === 'string' ? content : '', scope)
+  })
+  ipcMain.handle(IPC.WEB_LINKS_CANCEL, async () => {
+    const { cancelWebLinkCheck } = await import('./web-link-check.service')
+    cancelWebLinkCheck()
+    return true
+  })
+  ipcMain.handle(IPC.WEB_LINKS_PICK, async () => {
+    const { dialog, BrowserWindow } = await import('electron')
+    const { readFileSync } = await import('fs')
+    const win = BrowserWindow.getFocusedWindow()
+    const opts = {
+      title: 'Chọn file danh sách Link_web',
+      properties: ['openFile'] as ('openFile')[],
+      filters: [
+        { name: 'Text', extensions: ['txt', 'csv'] },
+        { name: 'All files', extensions: ['*'] }
+      ]
+    }
+    const result = win
+      ? await dialog.showOpenDialog(win, opts)
+      : await dialog.showOpenDialog(opts)
+    if (result.canceled || !result.filePaths[0]) return null
+    try {
+      return readFileSync(result.filePaths[0], 'utf8')
+    } catch (error) {
+      throw new Error(
+        error instanceof Error ? `Không đọc được file: ${error.message}` : 'Không đọc được file'
+      )
+    }
+  })
+  ipcMain.handle(IPC.WEB_LINKS_EXPORT, async (_e, content: string) => {
+    const { dialog, BrowserWindow } = await import('electron')
+    const { writeFileSync } = await import('fs')
+    const win = BrowserWindow.getFocusedWindow()
+    const opts = {
+      title: 'Xuất danh sách Link_web',
+      defaultPath: 'web-links.txt',
+      filters: [
+        { name: 'Text', extensions: ['txt'] },
+        { name: 'All files', extensions: ['*'] }
+      ]
+    }
+    const result = win
+      ? await dialog.showSaveDialog(win, opts)
+      : await dialog.showSaveDialog(opts)
+    if (result.canceled || !result.filePath) return null
+    writeFileSync(result.filePath, typeof content === 'string' ? content : '', 'utf8')
+    return result.filePath
   })
 }

@@ -8,6 +8,7 @@ import {
   FileCode2,
   Layers,
   ListOrdered,
+  RefreshCw,
   Save,
   Square,
   Trash2,
@@ -15,6 +16,7 @@ import {
 } from 'lucide-react'
 import type {
   ChromeProfile,
+  DrivePdfLaneInfo,
   FormLinkStyle,
   GmailCredentials,
   ImagePreview,
@@ -49,6 +51,17 @@ interface WorkItem {
   /** Số dòng 1-based trong danh sách Gmail (mail mới) */
   listLine?: number
   windowBounds?: WindowBounds
+  /** Folder PDF: hồ sơ 1–2 = Lan1, 3–4 = Lan2, … */
+  drivePdfLane?: number
+}
+
+const PDF_LANE_COUNT = 10
+const PDF_PROFILES_PER_LANE = 2
+
+/** Hồ sơ thứ 1–2 → Lan1, 3–4 → Lan2, … quá Lan10 thì quay lại Lan1. */
+function drivePdfLaneForOrdinal(ordinal: number): number {
+  const lane = Math.floor(Math.max(0, ordinal) / PDF_PROFILES_PER_LANE) + 1
+  return ((lane - 1) % PDF_LANE_COUNT) + 1
 }
 
 export function GmailPage(): JSX.Element {
@@ -80,9 +93,14 @@ export function GmailPage(): JSX.Element {
   const [formTitle, setFormTitle] = useState('')
   const [formDescription, setFormDescription] = useState('')
   const [formHeaderPath, setFormHeaderPath] = useState('')
+  const [formLinkEnabled, setFormLinkEnabled] = useState(DEFAULT_GMAIL_POST_SETUP.formLinkEnabled)
   const [formLinkStyle, setFormLinkStyle] = useState<FormLinkStyle>(
     DEFAULT_GMAIL_POST_SETUP.formLinkStyle
   )
+  const [drivePdfEnabled, setDrivePdfEnabled] = useState(DEFAULT_GMAIL_POST_SETUP.drivePdfEnabled)
+  const [drivePdfPath, setDrivePdfPath] = useState('')
+  const [drivePdfLanes, setDrivePdfLanes] = useState<DrivePdfLaneInfo[]>([])
+  const [reloadingPdf, setReloadingPdf] = useState(false)
   const [formHeaderPreview, setFormHeaderPreview] = useState<ImagePreview | null>(null)
   const [savingSetup, setSavingSetup] = useState(false)
   const stopRef = useRef(false)
@@ -220,7 +238,11 @@ export function GmailPage(): JSX.Element {
       setFormTitle(setup.formTitle || '')
       setFormDescription(setup.formDescription || '')
       setFormHeaderPath(setup.formHeaderPath || '')
+      setFormLinkEnabled(setup.formLinkEnabled !== false)
       setFormLinkStyle(setup.formLinkStyle === 'long' ? 'long' : 'short')
+      setDrivePdfEnabled(Boolean(setup.drivePdfEnabled))
+      setDrivePdfPath(setup.drivePdfPath || '')
+      void window.api.profiles.listDrivePdfLanes().then(setDrivePdfLanes).catch(() => undefined)
       if (
         setup.avatarPath ||
         setup.appsScriptPath ||
@@ -229,11 +251,24 @@ export function GmailPage(): JSX.Element {
       ) {
         pushLog(
           'info',
-          `Đã tải cấu hình post-login (ảnh: ${setup.avatarPath ? 'có' : 'chưa'} · header Form: ${setup.formHeaderPath ? 'có' : 'chưa'} · script: ${setup.appsScriptPath || (setup.appsScriptCode.trim() ? 'inline cũ' : 'chưa')} · form: ${setup.formFillEnabled ? 'bật' : 'tắt'} · link: ${setup.formLinkStyle === 'long' ? 'dài' : 'ngắn'}).`
+          `Đã tải cấu hình post-login (ảnh: ${setup.avatarPath ? 'có' : 'chưa'} · header Form: ${setup.formHeaderPath ? 'có' : 'chưa'} · script: ${setup.appsScriptPath || (setup.appsScriptCode.trim() ? 'inline cũ' : 'chưa')} · form: ${setup.formFillEnabled ? 'bật' : 'tắt'} · link Form: ${setup.formLinkEnabled === false ? 'tắt' : setup.formLinkStyle === 'long' ? 'dài' : 'ngắn'} · PDF: ${setup.drivePdfEnabled ? 'bật' : 'tắt'}).`
         )
       }
     } catch {
       // ignore
+    }
+  }
+
+  async function reloadDrivePdfLanes(): Promise<void> {
+    if (reloadingPdf) return
+    setReloadingPdf(true)
+    try {
+      setDrivePdfLanes(await window.api.profiles.listDrivePdfLanes())
+      toast({ tone: 'success', title: 'Đã cập nhật file PDF trong Lan1–Lan10.' })
+    } catch {
+      toast({ tone: 'error', title: 'Không đọc được thư mục data/File_PDF.' })
+    } finally {
+      setReloadingPdf(false)
     }
   }
 
@@ -250,7 +285,10 @@ export function GmailPage(): JSX.Element {
         formTitle,
         formDescription,
         formHeaderPath,
-        formLinkStyle
+        formLinkEnabled,
+        formLinkStyle,
+        drivePdfEnabled,
+        drivePdfPath
       })
       setAvatarPath(result.config.avatarPath)
       setAppsScriptPath(result.config.appsScriptPath)
@@ -259,7 +297,10 @@ export function GmailPage(): JSX.Element {
       setFormTitle(result.config.formTitle)
       setFormDescription(result.config.formDescription)
       setFormHeaderPath(result.config.formHeaderPath)
+      setFormLinkEnabled(result.config.formLinkEnabled !== false)
       setFormLinkStyle(result.config.formLinkStyle === 'long' ? 'long' : 'short')
+      setDrivePdfEnabled(Boolean(result.config.drivePdfEnabled))
+      setDrivePdfPath(result.config.drivePdfPath || '')
       pushLog('success', `Đã lưu cấu hình post-login → ${result.path}`)
     } catch (error) {
       pushLog(
@@ -611,7 +652,7 @@ export function GmailPage(): JSX.Element {
         `: ${gmail.email} → ${profile.name}` +
         (staggerMs > 0 ? ` · trễ ${Math.round(staggerMs / 1000)}s` : '') +
         (postSetupEnabled
-          ? ` · post-setup ON (ảnh: ${avatarPath ? 'có' : 'không'} · header: ${formHeaderPath ? 'có' : 'không'} · script: ${appsScriptPath ? 'có' : 'không'} · form: ${formFillEnabled ? 'điền' : 'không'})`
+          ? ` · post-setup ON (ảnh: ${avatarPath ? 'có' : 'không'} · header: ${formHeaderPath ? 'có' : 'không'} · script: ${appsScriptPath ? 'có' : 'không'} · form: ${formFillEnabled ? 'điền' : 'không'} · link Form: ${formLinkEnabled ? 'bật' : 'tắt'} · PDF: ${drivePdfEnabled ? 'bật' : 'tắt'})`
           : ' · post-setup OFF')
     )
 
@@ -661,7 +702,10 @@ export function GmailPage(): JSX.Element {
         formTitle: formTitle || undefined,
         formDescription: formDescription || undefined,
         formHeaderPath: formHeaderPath || undefined,
-        formLinkStyle
+        formLinkEnabled,
+        formLinkStyle,
+        drivePdfEnabled,
+        drivePdfLane: item.drivePdfLane
       })
 
       if (result.success) {
@@ -866,7 +910,10 @@ export function GmailPage(): JSX.Element {
         formTitle,
         formDescription,
         formHeaderPath,
-        formLinkStyle
+        formLinkEnabled,
+        formLinkStyle,
+        drivePdfEnabled,
+        drivePdfPath
       })
     } catch {
       // ignore
@@ -967,14 +1014,23 @@ export function GmailPage(): JSX.Element {
           }))
 
           const tiles = await window.api.profiles.tileLayout(batch.length)
+          const ordinalByProfile = new Map(allTargets.map((p, idx) => [p.id, idx]))
           for (let i = 0; i < batch.length; i++) {
             batch[i].windowBounds = tiles[i]
+            batch[i].drivePdfLane = drivePdfLaneForOrdinal(
+              ordinalByProfile.get(batch[i].profile.id) ?? i
+            )
           }
 
           pushLog(
             'info',
             `Đợt ${wave} · thử: ${batch
-              .map((b) => `d${b.listLine}:${b.gmail.email}→${b.profile.name}`)
+              .map(
+                (b) =>
+                  `d${b.listLine}:${b.gmail.email}→${b.profile.name}${
+                    drivePdfEnabled && b.drivePdfLane ? `·Lan${b.drivePdfLane}` : ''
+                  }`
+              )
               .join(', ')}`
           )
 
@@ -1123,7 +1179,10 @@ export function GmailPage(): JSX.Element {
         formTitle,
         formDescription,
         formHeaderPath,
-        formLinkStyle
+        formLinkEnabled,
+        formLinkStyle,
+        drivePdfEnabled,
+        drivePdfPath
       })
     } catch {
       // ignore
@@ -1157,6 +1216,14 @@ export function GmailPage(): JSX.Element {
       )
     }
 
+    const pdfOrdinalByProfile = new Map<string, number>()
+    let pdfOrdinal = 0
+    for (const pair of pairs) {
+      if (hasGmailCredentials(pair.profile.gmail)) continue
+      pdfOrdinalByProfile.set(pair.profile.id, pdfOrdinal)
+      pdfOrdinal += 1
+    }
+
     try {
       let offset = 0
       while (!stopRef.current && offset < pairs.length) {
@@ -1179,6 +1246,9 @@ export function GmailPage(): JSX.Element {
           for (const item of batch) {
             if (!hasGmailCredentials(item.profile.gmail)) {
               item.windowBounds = tiles[ti]
+              item.drivePdfLane = drivePdfLaneForOrdinal(
+                pdfOrdinalByProfile.get(item.profile.id) ?? ti
+              )
               ti += 1
             }
           }
@@ -1187,7 +1257,12 @@ export function GmailPage(): JSX.Element {
         pushLog(
           'info',
           `Batch dòng ${slice[0].listLine}–${slice[slice.length - 1].listLine}: ${batch
-            .map((b) => `d${b.listLine}:${b.gmail.email}→${b.profile.name}`)
+            .map(
+              (b) =>
+                `d${b.listLine}:${b.gmail.email}→${b.profile.name}${
+                  drivePdfEnabled && b.drivePdfLane ? `·Lan${b.drivePdfLane}` : ''
+                }`
+            )
             .join(', ')}`
         )
 
@@ -1497,16 +1572,16 @@ export function GmailPage(): JSX.Element {
           </div>
 
           <div className="panel p-4">
-            <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+            <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
               <div>
                 <h2 className="font-display text-base font-semibold text-ink">Sau khi login</h2>
-                <p className="mt-0.5 text-xs text-ink-muted">
-                  Login OK là đã gán mail vào profile → mở 2fa.live (cột 3). Tùy chọn thêm: Đổi
-                  ảnh → Form (tiêu đề/mô tả/header/màu) → Publish lấy link → Sheet → ô Menus →
-                  Apps Script.
+                <p className="mt-0.5 max-w-xl text-xs leading-5 text-ink-muted">
+                  Chạy lần lượt sau khi vào inbox: ảnh đại diện, Google Form, PDF trên Drive, rồi
+                  Sheet và Apps Script. Bước tắt sẽ được bỏ qua. Không lấy được link PDF thì vẫn
+                  chạy Sheet và Apps Script, giữ nguyên <code className="font-mono">[LINK_PDF]</code>.
                 </p>
               </div>
-              <label className="flex items-center gap-2 text-sm text-ink-soft">
+              <label className="flex shrink-0 items-center gap-2 rounded-lg border border-line bg-surface-muted/60 px-3 py-2 text-sm text-ink-soft">
                 <input
                   type="checkbox"
                   checked={postSetupEnabled}
@@ -1519,58 +1594,335 @@ export function GmailPage(): JSX.Element {
 
             <div
               className={cn(
-                'grid gap-4 transition',
+                'grid gap-3 transition',
                 !postSetupEnabled && 'pointer-events-none opacity-50'
               )}
             >
-              <div className="grid gap-3 md:grid-cols-[auto_1fr]">
-                <div className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-line bg-surface-muted text-ink-muted">
-                  {avatarPreview?.dataUrl ? (
-                    <img
-                      src={avatarPreview.dataUrl}
-                      alt="Ảnh đại diện sẽ dùng"
-                      className="h-full w-full object-cover"
-                    />
-                  ) : (
-                    <ImagePlus size={18} />
-                  )}
-                </div>
-                <div className="min-w-0">
-                  <label className="label">Ảnh đại diện</label>
-                  <div className="flex gap-2">
-                    <input
-                      className="input font-mono text-xs"
-                      disabled={running || !postSetupEnabled}
-                      value={avatarPath}
-                      onChange={(e) => setAvatarPath(e.target.value)}
-                      placeholder="D:\images\avatar.jpg"
-                    />
-                    <button
-                      type="button"
-                      className="btn-secondary shrink-0 !py-2"
-                      disabled={running || !postSetupEnabled}
-                      onClick={() => void pickAvatar()}
-                    >
-                      <ImagePlus size={14} />
-                      Chọn
-                    </button>
+              <section className="rounded-xl border border-line bg-surface-muted/40 p-3">
+                <div className="mb-3 flex items-center gap-2">
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-accent-soft text-[11px] font-semibold text-accent-strong">
+                    1
+                  </span>
+                  <div>
+                    <div className="text-sm font-medium text-ink">Ảnh đại diện</div>
+                    <p className="text-[11px] text-ink-muted">Để trống thì bỏ qua bước đổi ảnh.</p>
                   </div>
-                  <div className="mt-1 text-[11px]">
-                    {!avatarPath.trim() ? (
-                      <span className="text-ink-muted">Chưa chọn ảnh — bước đổi avatar sẽ bỏ qua.</span>
-                    ) : avatarPreview?.exists ? (
-                      <span className="text-ink-muted">
-                        {avatarPreview.name} · {Math.max(1, Math.round(avatarPreview.size / 1024))} KB
-                      </span>
+                </div>
+                <div className="grid gap-3 md:grid-cols-[auto_1fr]">
+                  <div className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-line bg-surface-muted text-ink-muted">
+                    {avatarPreview?.dataUrl ? (
+                      <img
+                        src={avatarPreview.dataUrl}
+                        alt="Ảnh đại diện sẽ dùng"
+                        className="h-full w-full object-cover"
+                      />
                     ) : (
-                      <span className="text-danger">Không tìm thấy file ảnh ở đường dẫn này.</span>
+                      <ImagePlus size={18} />
                     )}
                   </div>
+                  <div className="min-w-0">
+                    <div className="flex gap-2">
+                      <input
+                        className="input font-mono text-xs"
+                        disabled={running || !postSetupEnabled}
+                        value={avatarPath}
+                        onChange={(e) => setAvatarPath(e.target.value)}
+                        placeholder="D:\images\avatar.jpg"
+                      />
+                      <button
+                        type="button"
+                        className="btn-secondary shrink-0 !py-2"
+                        disabled={running || !postSetupEnabled}
+                        onClick={() => void pickAvatar()}
+                      >
+                        <ImagePlus size={14} />
+                        Chọn
+                      </button>
+                    </div>
+                    <div className="mt-1 text-[11px]">
+                      {!avatarPath.trim() ? (
+                        <span className="text-ink-muted">Chưa chọn ảnh.</span>
+                      ) : avatarPreview?.exists ? (
+                        <span className="text-ink-muted">
+                          {avatarPreview.name} · {Math.max(1, Math.round(avatarPreview.size / 1024))} KB
+                        </span>
+                      ) : (
+                        <span className="text-danger">Không tìm thấy file ảnh ở đường dẫn này.</span>
+                      )}
+                    </div>
+                  </div>
                 </div>
-              </div>
+              </section>
 
-              <div>
-                <label className="label">File Apps Script (.txt)</label>
+              <section className="rounded-xl border border-line bg-surface-muted/40 p-3">
+                <div className="mb-3 flex items-start gap-2">
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-accent-soft text-[11px] font-semibold text-accent-strong">
+                    2
+                  </span>
+                  <div>
+                    <div className="text-sm font-medium text-ink">Google Form</div>
+                    <p className="text-[11px] text-ink-muted">
+                      Tắt cả điền Form và lấy link thì không tạo Form mới.
+                    </p>
+                  </div>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <label className="flex items-center gap-2 rounded-lg border border-line bg-surface-raised px-3 py-2 text-sm text-ink-soft">
+                    <input
+                      type="checkbox"
+                      checked={formFillEnabled}
+                      disabled={running || !postSetupEnabled}
+                      onChange={(e) => setFormFillEnabled(e.target.checked)}
+                    />
+                    Bật điền Form
+                  </label>
+                  <label className="flex items-center gap-2 rounded-lg border border-line bg-surface-raised px-3 py-2 text-sm text-ink-soft">
+                    <input
+                      type="checkbox"
+                      checked={formLinkEnabled}
+                      disabled={running || !postSetupEnabled}
+                      onChange={(e) => setFormLinkEnabled(e.target.checked)}
+                    />
+                    Bật lấy đường link Form
+                  </label>
+                </div>
+
+                <div
+                  className={cn(
+                    'mt-3 grid gap-3 transition',
+                    !formFillEnabled && 'pointer-events-none opacity-50'
+                  )}
+                >
+                  <div>
+                    <label className="label">Untitled form</label>
+                    <input
+                      className="input text-sm"
+                      disabled={running || !postSetupEnabled || !formFillEnabled}
+                      value={formTitle}
+                      onChange={(e) => setFormTitle(e.target.value)}
+                      placeholder="Tiêu đề form"
+                    />
+                  </div>
+                  <div>
+                    <label className="label">Form description</label>
+                    <textarea
+                      className="input min-h-[72px] text-sm leading-5"
+                      disabled={running || !postSetupEnabled || !formFillEnabled}
+                      value={formDescription}
+                      onChange={(e) => setFormDescription(e.target.value)}
+                      placeholder="Mô tả form"
+                    />
+                  </div>
+                </div>
+
+                <div
+                  className={cn(
+                    'mt-3 transition',
+                    !formLinkEnabled && 'pointer-events-none opacity-50'
+                  )}
+                >
+                  <label className="label">Link sau Publish</label>
+                  <select
+                    className="input"
+                    disabled={running || !postSetupEnabled || !formLinkEnabled}
+                    value={formLinkStyle}
+                    onChange={(e) =>
+                      setFormLinkStyle(e.target.value === 'long' ? 'long' : 'short')
+                    }
+                  >
+                    <option value="short">Link ngắn (forms.gle/…)</option>
+                    <option value="long">Link dài (docs.google.com/forms/…/viewform)</option>
+                  </select>
+                  <p className="mt-1 text-[11px] text-ink-muted">
+                    {!formLinkEnabled
+                      ? 'Tắt — không Publish / Copy link.'
+                      : formLinkStyle === 'short'
+                        ? 'Publish → tick Shorten URL → Copy (forms.gle).'
+                        : 'Publish → Copy link dài, không tick Shorten URL.'}
+                  </p>
+                </div>
+
+                <div
+                  className={cn(
+                    'mt-3 grid gap-3 border-t border-line pt-3 transition md:grid-cols-[auto_1fr]',
+                    !formFillEnabled && !formLinkEnabled && 'pointer-events-none opacity-50'
+                  )}
+                >
+                  <div className="flex h-16 w-28 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-line bg-surface-muted text-ink-muted">
+                    {formHeaderPreview?.dataUrl ? (
+                      <img
+                        src={formHeaderPreview.dataUrl}
+                        alt="Ảnh header Form"
+                        className="h-full w-full object-cover"
+                      />
+                    ) : (
+                      <ImagePlus size={18} />
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <label className="label">Ảnh header Form</label>
+                    <div className="flex gap-2">
+                      <input
+                        className="input font-mono text-xs"
+                        disabled={running || !postSetupEnabled || (!formFillEnabled && !formLinkEnabled)}
+                        value={formHeaderPath}
+                        onChange={(e) => setFormHeaderPath(e.target.value)}
+                        placeholder="D:\images\form-header.jpg"
+                      />
+                      <button
+                        type="button"
+                        className="btn-secondary shrink-0 !py-2"
+                        disabled={running || !postSetupEnabled || (!formFillEnabled && !formLinkEnabled)}
+                        onClick={() => void pickFormHeader()}
+                      >
+                        <ImagePlus size={14} />
+                        Chọn
+                      </button>
+                      {formHeaderPath ? (
+                        <button
+                          type="button"
+                          className="btn-ghost shrink-0 !px-2 !py-2 text-danger"
+                          disabled={running || !postSetupEnabled || (!formFillEnabled && !formLinkEnabled)}
+                          onClick={() => setFormHeaderPath('')}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      ) : null}
+                    </div>
+                    <div className="mt-1 text-[11px]">
+                      {!formHeaderPath.trim() ? (
+                        <span className="text-ink-muted">
+                          Chưa chọn — bỏ qua upload header (Customize theme → Header).
+                        </span>
+                      ) : formHeaderPreview?.exists ? (
+                        <span className="text-ink-muted">
+                          {formHeaderPreview.name} · {Math.max(1, Math.round(formHeaderPreview.size / 1024))}{' '}
+                          KB · nên tỉ lệ ~4:1
+                        </span>
+                      ) : (
+                        <span className="text-danger">Không tìm thấy file ảnh ở đường dẫn này.</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <section className="rounded-xl border border-line bg-surface-muted/40 p-3">
+                <div
+                  className={cn(
+                    'flex flex-wrap items-center justify-between gap-2',
+                    drivePdfEnabled && 'mb-3 items-start'
+                  )}
+                >
+                  <div className="flex items-start gap-2">
+                    <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-accent-soft text-[11px] font-semibold text-accent-strong">
+                      3
+                    </span>
+                    <div>
+                      <div className="text-sm font-medium text-ink">PDF trên Google Drive</div>
+                      {drivePdfEnabled ? (
+                        <p className="text-[11px] text-ink-muted">
+                          Một file trong <span className="font-mono">Lan1</span> upload cho 2 hồ sơ,
+                          <span className="font-mono"> Lan2</span> cho 2 hồ sơ tiếp theo, đến hết danh
+                          sách. Upload → Share → thay <code className="font-mono">[LINK_PDF]</code>.
+                        </p>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {drivePdfEnabled ? (
+                      <button
+                        type="button"
+                        className="btn-secondary shrink-0 !py-1.5"
+                        disabled={running || !postSetupEnabled || reloadingPdf}
+                        onClick={() => void reloadDrivePdfLanes()}
+                      >
+                        <RefreshCw size={14} className={reloadingPdf ? 'animate-spin' : undefined} />
+                        Làm mới
+                      </button>
+                    ) : null}
+                    <label className="flex items-center gap-2 text-sm text-ink-soft">
+                      <input
+                        type="checkbox"
+                        checked={drivePdfEnabled}
+                        disabled={running || !postSetupEnabled}
+                        onChange={(e) => setDrivePdfEnabled(e.target.checked)}
+                      />
+                      Bật upload PDF
+                    </label>
+                  </div>
+                </div>
+                {drivePdfEnabled ? (
+                  <div>
+                    <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                      {(drivePdfLanes.length
+                        ? drivePdfLanes
+                        : Array.from({ length: 10 }, (_, i) => ({
+                            lane: i + 1,
+                            folder: `Lan${i + 1}`,
+                            fileName: ''
+                          }))
+                      ).map((lane) => {
+                        const pdfProfileCount =
+                          mailKind === 'new'
+                            ? newMailPairs.filter((pair) => !hasGmailCredentials(pair.profile.gmail))
+                                .length
+                            : emptySlots.length
+                        const lanesNeeded = Math.min(
+                          PDF_LANE_COUNT,
+                          Math.ceil(pdfProfileCount / PDF_PROFILES_PER_LANE)
+                        )
+                        const missing = lane.lane <= lanesNeeded && !lane.fileName
+                        const from = (lane.lane - 1) * PDF_PROFILES_PER_LANE + 1
+                        const to = lane.lane * PDF_PROFILES_PER_LANE
+                        return (
+                          <div
+                            key={lane.lane}
+                            className={cn(
+                              'rounded-lg border px-2.5 py-1.5',
+                              missing ? 'border-danger/40 bg-danger/10' : 'border-line bg-surface-raised'
+                            )}
+                          >
+                            <div className="flex items-center justify-between gap-2 text-[11px] text-ink-muted">
+                              <span>
+                                Hồ sơ {from}–{to}
+                              </span>
+                              <span className="font-mono">{lane.folder}</span>
+                            </div>
+                            <div
+                              className={cn(
+                                'truncate text-xs',
+                                lane.fileName ? 'text-ink' : missing ? 'text-danger' : 'text-ink-muted'
+                              )}
+                              title={lane.fileName || 'Chưa có PDF'}
+                            >
+                              {lane.fileName || 'Chưa có PDF'}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                    <p className="mt-2 text-[11px] text-ink-muted">
+                      Hồ sơ 1–2 dùng Lan1, 3–4 dùng Lan2, cứ thế đến hết. Quá 20 hồ sơ thì quay lại
+                      Lan1. Ô đỏ là folder sắp dùng nhưng chưa có PDF. Nếu upload hoặc lấy link thất
+                      bại, các bước sau vẫn chạy.
+                    </p>
+                  </div>
+                ) : null}
+              </section>
+
+              <section className="rounded-xl border border-line bg-surface-muted/40 p-3">
+                <div className="mb-3 flex items-center gap-2">
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-accent-soft text-[11px] font-semibold text-accent-strong">
+                    4
+                  </span>
+                  <div>
+                    <div className="text-sm font-medium text-ink">Apps Script</div>
+                    <p className="text-[11px] text-ink-muted">
+                      Dán vào Sheet sau khi tạo xong. Token thiếu link PDF vẫn được dán.
+                    </p>
+                  </div>
+                </div>
                 <div className="flex gap-2">
                   <input
                     className="input font-mono text-xs"
@@ -1600,140 +1952,12 @@ export function GmailPage(): JSX.Element {
                   ) : null}
                 </div>
                 <p className="mt-1 text-[11px] text-ink-muted">
-                  Trong file có thể dùng <code className="font-mono">[LINK_SHEET]</code> và{' '}
-                  <code className="font-mono">[LINK_FORM]</code> — app sẽ thay bằng URL Sheet /
-                  Form (sau Publish).
+                  <code className="font-mono">[LINK_SHEET]</code>,{' '}
+                  <code className="font-mono">[LINK_FORM]</code>,{' '}
+                  <code className="font-mono">[LINK_PDF]</code> được thay bằng URL vừa lấy. Không có
+                  link PDF thì giữ <code className="font-mono">[LINK_PDF]</code> và vẫn chạy script.
                 </p>
-              </div>
-
-              <div>
-                <label className="label">Link Form sau Publish</label>
-                <select
-                  className="input"
-                  disabled={running || !postSetupEnabled}
-                  value={formLinkStyle}
-                  onChange={(e) =>
-                    setFormLinkStyle(e.target.value === 'long' ? 'long' : 'short')
-                  }
-                >
-                  <option value="short">Link ngắn (forms.gle/…)</option>
-                  <option value="long">Link dài (docs.google.com/forms/…/viewform)</option>
-                </select>
-                <p className="mt-1 text-[11px] text-ink-muted">
-                  {formLinkStyle === 'short'
-                    ? 'Publish → Publish trong hộp thoại → tick Shorten URL → Copy (forms.gle).'
-                    : 'Publish → Publish trong hộp thoại → Copy (không tick Shorten URL).'}
-                </p>
-              </div>
-
-              <div className="rounded-xl border border-line bg-surface-muted/40 p-3">
-                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <div className="text-sm font-medium text-ink">Nội dung Google Form</div>
-                    <p className="mt-0.5 text-[11px] text-ink-muted">
-                      Sau khi mở tab Form: điền tiêu đề/mô tả (nếu bật) và upload ảnh header.
-                    </p>
-                  </div>
-                  <label className="flex items-center gap-2 text-sm text-ink-soft">
-                    <input
-                      type="checkbox"
-                      checked={formFillEnabled}
-                      disabled={running || !postSetupEnabled}
-                      onChange={(e) => setFormFillEnabled(e.target.checked)}
-                    />
-                    Bật điền Form
-                  </label>
-                </div>
-                <div className="space-y-3">
-                  <div
-                    className={cn(
-                      'grid gap-3 transition',
-                      !formFillEnabled && 'pointer-events-none opacity-50'
-                    )}
-                  >
-                    <div>
-                      <label className="label">Untitled form</label>
-                      <input
-                        className="input text-sm"
-                        disabled={running || !postSetupEnabled || !formFillEnabled}
-                        value={formTitle}
-                        onChange={(e) => setFormTitle(e.target.value)}
-                        placeholder="Tiêu đề form"
-                      />
-                    </div>
-                    <div>
-                      <label className="label">Form description</label>
-                      <textarea
-                        className="input min-h-[72px] text-sm leading-5"
-                        disabled={running || !postSetupEnabled || !formFillEnabled}
-                        value={formDescription}
-                        onChange={(e) => setFormDescription(e.target.value)}
-                        placeholder="Mô tả form"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="grid gap-3 border-t border-line pt-3 md:grid-cols-[auto_1fr]">
-                    <div className="flex h-16 w-28 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-line bg-surface-muted text-ink-muted">
-                      {formHeaderPreview?.dataUrl ? (
-                        <img
-                          src={formHeaderPreview.dataUrl}
-                          alt="Ảnh header Form"
-                          className="h-full w-full object-cover"
-                        />
-                      ) : (
-                        <ImagePlus size={18} />
-                      )}
-                    </div>
-                    <div className="min-w-0">
-                      <label className="label">Ảnh header Form</label>
-                      <div className="flex gap-2">
-                        <input
-                          className="input font-mono text-xs"
-                          disabled={running || !postSetupEnabled}
-                          value={formHeaderPath}
-                          onChange={(e) => setFormHeaderPath(e.target.value)}
-                          placeholder="D:\images\form-header.jpg"
-                        />
-                        <button
-                          type="button"
-                          className="btn-secondary shrink-0 !py-2"
-                          disabled={running || !postSetupEnabled}
-                          onClick={() => void pickFormHeader()}
-                        >
-                          <ImagePlus size={14} />
-                          Chọn
-                        </button>
-                        {formHeaderPath ? (
-                          <button
-                            type="button"
-                            className="btn-ghost shrink-0 !px-2 !py-2 text-danger"
-                            disabled={running || !postSetupEnabled}
-                            onClick={() => setFormHeaderPath('')}
-                          >
-                            <Trash2 size={14} />
-                          </button>
-                        ) : null}
-                      </div>
-                      <div className="mt-1 text-[11px]">
-                        {!formHeaderPath.trim() ? (
-                          <span className="text-ink-muted">
-                            Chưa chọn — bỏ qua upload header (Customize theme → Header).
-                          </span>
-                        ) : formHeaderPreview?.exists ? (
-                          <span className="text-ink-muted">
-                            {formHeaderPreview.name} ·{' '}
-                            {Math.max(1, Math.round(formHeaderPreview.size / 1024))} KB · nên tỉ lệ
-                            ~4:1
-                          </span>
-                        ) : (
-                          <span className="text-danger">Không tìm thấy file ảnh ở đường dẫn này.</span>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
+              </section>
 
               <div className="flex justify-end border-t border-line pt-3">
                 <button

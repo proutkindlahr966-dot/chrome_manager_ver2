@@ -27,6 +27,9 @@ export function ToastHost(): JSX.Element {
         return (
           <div
             key={item.id}
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
             className={cn(
               'pointer-events-auto animate-fade-up rounded-xl border bg-surface-overlay px-3.5 py-3 shadow-panel',
               toneClass[item.tone]

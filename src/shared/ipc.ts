@@ -31,7 +31,9 @@ export const IPC = {
   GMAIL_FAILED_SAVE: 'gmailList:failedSave',
   GMAIL_SETUP_LOAD: 'gmailSetup:load',
   GMAIL_SETUP_SAVE: 'gmailSetup:save',
+  GMAIL_DRIVE_PDF_LANES: 'gmail:drivePdfLanes',
   DIALOG_OPEN_IMAGE: 'dialog:openImage',
+  DIALOG_OPEN_PDF: 'dialog:openPdf',
   DIALOG_OPEN_SCRIPT_TEXT: 'dialog:openScriptText',
   FILE_IMAGE_PREVIEW: 'file:imagePreview',
 
@@ -52,7 +54,26 @@ export const IPC = {
   DASHBOARD_STATS: 'dashboard:stats',
   SETTINGS_GET: 'settings:get',
   SETTINGS_UPDATE: 'settings:update',
-  SETTINGS_DETECT_CHROME: 'settings:detectChrome'
+  SETTINGS_DETECT_CHROME: 'settings:detectChrome',
+  SETTINGS_PICK_PROFILES_DIR: 'settings:pickProfilesDir',
+  SETTINGS_DISK_SPACE: 'settings:diskSpace',
+  SETTINGS_OPEN_PATH: 'settings:openPath',
+  APP_INFO: 'app:info',
+  APP_CHECK_UPDATES: 'app:checkUpdates',
+  APP_INSTALL_UPDATE: 'app:installUpdate',
+  DATA_BACKUP_EXPORT: 'data:backupExport',
+  DATA_BACKUP_RESTORE: 'data:backupRestore',
+  DATA_BACKUP_LIST: 'data:backupList',
+  DATA_BACKUP_RESTORE_FILE: 'data:backupRestoreFile',
+
+  WEB_LINKS_LOAD: 'webLinks:load',
+  WEB_LINKS_SAVE: 'webLinks:save',
+  WEB_LINKS_CHECK: 'webLinks:check',
+  WEB_LINKS_CHECK_LIST: 'webLinks:checkList',
+  WEB_LINKS_CANCEL: 'webLinks:cancel',
+  WEB_LINKS_PROGRESS: 'webLinks:progress',
+  WEB_LINKS_PICK: 'webLinks:pick',
+  WEB_LINKS_EXPORT: 'webLinks:export'
 } as const
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC]

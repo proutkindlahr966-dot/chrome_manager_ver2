@@ -1,11 +1,15 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react'
+import { ExternalLink } from 'lucide-react'
 import { Modal } from '@/components/ui/Modal'
 import { Switch } from '@/components/ui/Switch'
 import { useAppStore } from '@/stores/app-store'
+import { askConfirm, toast } from '@/stores/ui-store'
 import type { ChromeProfile, ProxyType } from '@shared/types'
 import { DEFAULT_PROXY } from '@shared/types'
 import { parseGmailLine, serializeGmail } from '@shared/gmail'
 import { parseProxyList, parseProxyString, serializeProxy } from '@shared/proxy'
+import { resolveCreateProfilesRoot } from '@shared/profile-roots'
+import { formatBytes, isLowDisk } from '@shared/disk'
 import {
   DEFAULT_PROFILE_PREFIX,
   formatProfileName,
@@ -151,6 +155,23 @@ export function ProfileFormModal({ open, profile, onClose }: ProfileFormModalPro
     if (isEdit && !name.trim()) {
       setError('Vui lòng nhập tên hồ sơ')
       return
+    }
+
+    if (!profile && settings) {
+      const target = resolveCreateProfilesRoot(settings) || settings.profilesRoot
+      try {
+        const [info] = await window.api.settings.diskSpace([target])
+        if (info && isLowDisk(info)) {
+          const ok = await askConfirm({
+            title: 'Ổ đĩa gần hết chỗ',
+            description: `Thư mục tạo hồ sơ còn ${formatBytes(info.freeBytes)} trống. Vẫn tạo?`,
+            confirmLabel: 'Vẫn tạo'
+          })
+          if (!ok) return
+        }
+      } catch {
+        // ignore
+      }
     }
 
     setSaving(true)
@@ -505,10 +526,41 @@ export function ProfileFormModal({ open, profile, onClose }: ProfileFormModalPro
         </div>
 
         {profile ? (
-          <div className="rounded-lg border border-line bg-surface-muted/50 px-3 py-2 text-xs text-ink-muted">
-            Thư mục dữ liệu: <span className="font-mono text-ink-soft">{profile.dataDir}</span>
+          <div className="flex items-start justify-between gap-2 rounded-lg border border-line bg-surface-muted/50 px-3 py-2 text-xs text-ink-muted">
+            <div className="min-w-0">
+              Thư mục dữ liệu:{' '}
+              <span className="font-mono text-ink-soft">{profile.dataDir}</span>
+            </div>
+            <button
+              type="button"
+              className="btn-ghost shrink-0 !px-2 !py-1"
+              title="Mở trong Explorer"
+              onClick={() => {
+                void window.api.settings.openPath(profile.dataDir).then((result) => {
+                  if (!result.ok) {
+                    toast({
+                      tone: 'error',
+                      title: 'Không mở được thư mục',
+                      description: result.error
+                    })
+                  }
+                })
+              }}
+            >
+              <ExternalLink size={13} />
+              Mở
+            </button>
           </div>
-        ) : null}
+        ) : (
+          <div className="rounded-lg border border-line bg-surface-muted/50 px-3 py-2 text-xs text-ink-muted">
+            Hồ sơ mới lưu tại:{' '}
+            <span className="font-mono text-ink-soft">
+              {settings
+                ? resolveCreateProfilesRoot(settings) || settings.profilesRoot
+                : '—'}
+            </span>
+          </div>
+        )}
 
         {error ? <div className="text-sm text-danger">{error}</div> : null}
 

@@ -1,11 +1,14 @@
+import { useEffect, useState } from 'react'
 import { NavLink } from 'react-router-dom'
 import {
   LayoutDashboard,
   Users,
   FolderKanban,
   Mail,
+  Link2,
   Settings,
   Chrome,
+  Keyboard,
   Moon,
   Sun,
   Monitor
@@ -18,6 +21,7 @@ const nav = [
   { to: '/profiles', label: 'Hồ sơ', icon: Users },
   { to: '/groups', label: 'Nhóm', icon: FolderKanban },
   { to: '/gmail', label: 'Gmail', icon: Mail },
+  { to: '/links', label: 'Link web', icon: Link2 },
   { to: '/settings', label: 'Cài đặt', icon: Settings }
 ]
 
@@ -25,6 +29,7 @@ interface SidebarProps {
   theme: 'light' | 'dark'
   mode: 'system' | 'light' | 'dark'
   onCycleTheme: () => void
+  onOpenShortcuts?: () => void
 }
 
 function themeLabel(mode: SidebarProps['mode']): string {
@@ -33,8 +38,16 @@ function themeLabel(mode: SidebarProps['mode']): string {
   return 'Chế độ sáng'
 }
 
-export function Sidebar({ theme, mode, onCycleTheme }: SidebarProps): JSX.Element {
+export function Sidebar({ theme, mode, onCycleTheme, onOpenShortcuts }: SidebarProps): JSX.Element {
   const stats = useAppStore((s) => s.stats)
+  const [version, setVersion] = useState('')
+
+  useEffect(() => {
+    void window.api.app
+      .info()
+      .then((info) => setVersion(info.version))
+      .catch(() => undefined)
+  }, [])
 
   return (
     <aside className="flex h-full w-[220px] shrink-0 flex-col border-r border-line bg-surface-raised/80 backdrop-blur-sm">
@@ -47,7 +60,9 @@ export function Sidebar({ theme, mode, onCycleTheme }: SidebarProps): JSX.Elemen
             <div className="truncate font-display text-sm font-semibold tracking-tight text-ink">
               Chrome Manager
             </div>
-            <div className="text-2xs text-ink-muted">Profile Control</div>
+            <div className="text-2xs text-ink-muted">
+              {version ? `v${version}` : 'Profile Control'}
+            </div>
           </div>
         </div>
       </div>
@@ -88,6 +103,15 @@ export function Sidebar({ theme, mode, onCycleTheme }: SidebarProps): JSX.Elemen
             </span>
           </div>
         </div>
+        <button
+          type="button"
+          className="btn-secondary btn-sm mb-2 w-full"
+          title="Phím tắt (F1)"
+          onClick={onOpenShortcuts}
+        >
+          <Keyboard size={15} />
+          Phím tắt
+        </button>
         <button
           type="button"
           className="btn-secondary btn-sm w-full"

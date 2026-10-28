@@ -1,4 +1,4 @@
-import { useEffect, useRef, type MouseEvent as ReactMouseEvent } from 'react'
+import { useEffect, useRef, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
 import {
   Eraser,
   History,
@@ -8,17 +8,27 @@ import {
   Trash2
 } from 'lucide-react'
 import type { ChromeProfile, ProfileGroup } from '@shared/types'
-import { hasGmailCredentials } from '@shared/gmail'
+import { hasAttachedEmail, hasGmailCredentials } from '@shared/gmail'
+import { hasProxy } from '@shared/proxy'
+import { storageDriveLabel } from '@shared/profile-roots'
 import { Badge } from '@/components/ui/Badge'
 import { Switch } from '@/components/ui/Switch'
 import { cn, formatRelative, statusBadgeTone, statusLabel } from '@/lib/utils'
-import { isColumnVisible, type ProfileColumnId } from './profile-columns'
+import {
+  DEFAULT_COLUMN_WEIGHTS,
+  isColumnVisible,
+  PROFILE_COLUMNS,
+  type ColumnWeights,
+  type ProfileColumnId
+} from './profile-columns'
 
 interface ProfileTableProps {
   profiles: ChromeProfile[]
   groups: ProfileGroup[]
   selectedIds: Set<string>
   visibleColumns: ProfileColumnId[]
+  columnWeights: ColumnWeights
+  onColumnWeightsChange: (weights: ColumnWeights) => void
   onToggle: (id: string) => void
   onSelectAll: () => void
   /** Chọn một dải id (kéo chuột / Shift+click) */
@@ -51,6 +61,8 @@ export function ProfileTable({
   groups,
   selectedIds,
   visibleColumns,
+  columnWeights,
+  onColumnWeightsChange,
   onToggle,
   onSelectAll,
   onSelectIds,
@@ -75,6 +87,124 @@ export function ProfileTable({
     (show('status') ? 1 : 0) +
     (show('lastLaunched') ? 1 : 0) +
     (show('actions') ? 1 : 0)
+
+  const visibleOrder = PROFILE_COLUMNS.map((col) => col.id).filter((id) => show(id))
+  const weightSum = visibleOrder.reduce((sum, id) => sum + columnWeights[id], 0) || 1
+  const tableRef = useRef<HTMLTableElement>(null)
+  const weightsRef = useRef(columnWeights)
+  weightsRef.current = columnWeights
+  const onWeightsChangeRef = useRef(onColumnWeightsChange)
+  onWeightsChangeRef.current = onColumnWeightsChange
+  const resizeCleanupRef = useRef<(() => void) | null>(null)
+
+  useEffect(() => {
+    return () => resizeCleanupRef.current?.()
+  }, [])
+
+  function columnWidth(id: ProfileColumnId): string {
+    return `calc((100% - 3rem) * ${columnWeights[id] / weightSum})`
+  }
+
+  function pairAt(id: ProfileColumnId): { nextId: ProfileColumnId; order: ProfileColumnId[] } | null {
+    const order = PROFILE_COLUMNS.map((col) => col.id).filter((cid) =>
+      isColumnVisible(visibleColumns, cid)
+    )
+    const index = order.indexOf(id)
+    const nextId = order[index + 1]
+    if (index < 0 || !nextId) return null
+    return { nextId, order }
+  }
+
+  function onResizeStart(event: ReactMouseEvent, id: ProfileColumnId): void {
+    if (event.button !== 0) return
+    event.preventDefault()
+    event.stopPropagation()
+    const pair = pairAt(id)
+    const table = tableRef.current
+    if (!pair || !table) return
+    resizeCleanupRef.current?.()
+
+    const { nextId, order } = pair
+    const startX = event.clientX
+    const dataWidth = Math.max(1, table.clientWidth - 48)
+    const start = { ...weightsRef.current }
+    const total = order.reduce((sum, cid) => sum + start[cid], 0)
+    const share = start[id] + start[nextId]
+    const min = Math.min(share * 0.45, Math.max(4, total * 0.045))
+
+    function onMove(ev: MouseEvent): void {
+      const delta = ((ev.clientX - startX) / dataWidth) * total
+      const nextWidth = Math.max(min, Math.min(share - min, start[id] + delta))
+      onWeightsChangeRef.current({
+        ...weightsRef.current,
+        [id]: nextWidth,
+        [nextId]: share - nextWidth
+      })
+    }
+    function endResize(): void {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', endResize)
+      document.body.classList.remove('cursor-col-resize', 'select-none')
+      resizeCleanupRef.current = null
+    }
+    resizeCleanupRef.current = endResize
+    document.body.classList.add('cursor-col-resize', 'select-none')
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', endResize)
+  }
+
+  function resetBoundary(id: ProfileColumnId): void {
+    const pair = pairAt(id)
+    if (!pair) return
+    const current = weightsRef.current
+    const share = current[id] + current[pair.nextId]
+    const leftDefault = DEFAULT_COLUMN_WEIGHTS[id]
+    const rightDefault = DEFAULT_COLUMN_WEIGHTS[pair.nextId]
+    const left = (share * leftDefault) / (leftDefault + rightDefault)
+    onWeightsChangeRef.current({
+      ...current,
+      [id]: left,
+      [pair.nextId]: share - left
+    })
+  }
+
+  function headerCell(
+    id: ProfileColumnId,
+    content: ReactNode,
+    options?: { title?: string; align?: 'right' }
+  ): JSX.Element | null {
+    if (!show(id)) return null
+    const label = PROFILE_COLUMNS.find((col) => col.id === id)?.label ?? id
+    const canResize = visibleOrder[visibleOrder.length - 1] !== id
+    return (
+      <th
+        className={cn(
+          'relative px-3 py-3 font-medium',
+          options?.align === 'right' && 'text-right'
+        )}
+        style={{ width: columnWidth(id) }}
+        title={options?.title}
+      >
+        {content}
+        {canResize ? (
+          <span
+            role="separator"
+            aria-orientation="vertical"
+            aria-label={`Chỉnh tỷ lệ cột ${label}`}
+            title="Kéo để chỉnh tỷ lệ cột. Nhấp đúp để trả hai cột này về tỷ lệ mặc định."
+            data-no-row-select
+            className="absolute inset-y-0 right-0 z-[2] w-2 cursor-col-resize touch-none border-r border-line hover:border-accent hover:bg-accent/30"
+            onMouseDown={(event) => onResizeStart(event, id)}
+            onDoubleClick={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              resetBoundary(id)
+            }}
+          />
+        ) : null}
+      </th>
+    )
+  }
 
   const anchorIndexRef = useRef(0)
   const dragRef = useRef<{
@@ -188,12 +318,19 @@ export function ProfileTable({
     <div className="panel overflow-hidden">
       <div className="overflow-x-auto">
         <table
+          ref={tableRef}
           className="w-full table-fixed text-left text-sm"
-          style={{ minWidth: Math.max(640, colCount * 110) }}
+          style={{ minWidth: Math.max(640, colCount * 96) }}
         >
+          <colgroup>
+            <col style={{ width: '3rem' }} />
+            {visibleOrder.map((id) => (
+              <col key={id} style={{ width: columnWidth(id) }} />
+            ))}
+          </colgroup>
           <thead className="sticky top-0 z-[1] bg-surface-muted/95 text-xs uppercase tracking-wide text-ink-muted backdrop-blur-sm">
             <tr>
-              <th className="w-12 px-3 py-3">
+              <th className="px-3 py-3" style={{ width: '3rem' }}>
                 <input
                   type="checkbox"
                   checked={allSelected}
@@ -201,31 +338,22 @@ export function ProfileTable({
                   aria-label="Chọn tất cả"
                 />
               </th>
-              {show('name') ? <th className="w-[14%] px-3 py-3 font-medium">Hồ sơ</th> : null}
-              {show('notes') ? <th className="w-[16%] px-3 py-3 font-medium">Ghi chú</th> : null}
-              {show('group') ? <th className="w-[12%] px-3 py-3 font-medium">Nhóm</th> : null}
-              {show('gmail') ? <th className="w-[18%] px-3 py-3 font-medium">Gmail</th> : null}
-              {show('proxy') ? <th className="w-[14%] px-3 py-3 font-medium">Proxy</th> : null}
-              {show('restore') ? (
-                <th
-                  className="w-[88px] px-3 py-3 font-medium"
-                  title="Áp dụng cho cả nhóm — mở lại tab lần chạy trước (mặc định bật)"
-                >
-                  <span className="inline-flex items-center gap-1">
-                    <History size={12} />
-                    Tab cũ
-                  </span>
-                </th>
-              ) : null}
-              {show('status') ? (
-                <th className="w-[110px] px-3 py-3 font-medium">Trạng thái</th>
-              ) : null}
-              {show('lastLaunched') ? (
-                <th className="w-[120px] px-3 py-3 font-medium">Lần chạy</th>
-              ) : null}
-              {show('actions') ? (
-                <th className="w-[140px] px-3 py-3 font-medium text-right">Thao tác</th>
-              ) : null}
+              {headerCell('name', 'Hồ sơ')}
+              {headerCell('notes', 'Ghi chú')}
+              {headerCell('group', 'Nhóm')}
+              {headerCell('gmail', 'Gmail')}
+              {headerCell('proxy', 'Proxy', { title: 'Hồ sơ đã gắn proxy hay chưa' })}
+              {headerCell(
+                'restore',
+                <span className="inline-flex items-center gap-1">
+                  <History size={12} />
+                  Tab cũ
+                </span>,
+                { title: 'Áp dụng cho cả nhóm — mở lại tab lần chạy trước (mặc định bật)' }
+              )}
+              {headerCell('status', 'Trạng thái')}
+              {headerCell('lastLaunched', 'Lần chạy')}
+              {headerCell('actions', 'Thao tác', { align: 'right' })}
             </tr>
           </thead>
           <tbody>
@@ -234,6 +362,7 @@ export function ProfileTable({
               const selected = selectedIds.has(profile.id)
               const running = profile.status === 'running'
               const hasGmail = hasGmailCredentials(profile.gmail)
+              const emailAttached = hasAttachedEmail(profile.gmail)
               const restoreLastSession = group ? group.restoreLastSession : true
               const canToggleRestore = Boolean(group)
 
@@ -259,8 +388,17 @@ export function ProfileTable({
                   </td>
                   {show('name') ? (
                     <td className="px-3 py-2.5 align-middle">
-                      <div className="truncate font-medium text-ink" title={profile.name}>
-                        {profile.name}
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        <div className="truncate font-medium text-ink" title={profile.name}>
+                          {profile.name}
+                        </div>
+                        {storageDriveLabel(profile.dataDir) ? (
+                          <span title={profile.dataDir}>
+                            <Badge className="shrink-0">
+                              {storageDriveLabel(profile.dataDir)}
+                            </Badge>
+                          </span>
+                        ) : null}
                       </div>
                       {profile.tags.length > 0 ? (
                         <div className="mt-1 flex flex-wrap gap-1">
@@ -298,7 +436,7 @@ export function ProfileTable({
                   ) : null}
                   {show('gmail') ? (
                     <td className="px-3 py-2.5 align-middle">
-                      {hasGmail ? (
+                      {emailAttached ? (
                         <div className="min-w-0">
                           <div
                             className="truncate font-mono text-xs text-ink-soft"
@@ -307,37 +445,35 @@ export function ProfileTable({
                             {profile.gmail?.email}
                           </div>
                           <div className="mt-1 flex flex-wrap gap-1">
-                            <Badge tone="accent">Gmail</Badge>
+                            <Badge tone="success">Đã gắn</Badge>
+                            {hasGmail ? <Badge tone="accent">Gmail</Badge> : null}
                             {profile.autoLoginGmail ? <Badge>Auto</Badge> : null}
                           </div>
                         </div>
                       ) : (
-                        <span className="text-ink-muted">—</span>
+                        <Badge>Chưa gắn</Badge>
                       )}
                     </td>
                   ) : null}
                   {show('proxy') ? (
-                    <td className="px-3 py-2.5 align-middle font-mono text-xs text-ink-soft">
-                      <span
-                        className="block truncate"
-                        title={
-                          profile.proxy.type === 'none' || !profile.proxy.host
-                            ? undefined
-                            : `${profile.proxy.host}:${profile.proxy.port ?? ''}${
-                                profile.proxy.username
-                                  ? `:${profile.proxy.username}:${profile.proxy.password ? '••••' : ''}`
-                                  : ''
-                              }`
-                        }
-                      >
-                        {profile.proxy.type === 'none' || !profile.proxy.host
-                          ? '—'
-                          : `${profile.proxy.host}:${profile.proxy.port ?? ''}${
-                              profile.proxy.username
-                                ? `:${profile.proxy.username}:${profile.proxy.password ? '••••' : ''}`
-                                : ''
+                    <td className="px-3 py-2.5 align-middle">
+                      {hasProxy(profile.proxy) ? (
+                        <div className="min-w-0">
+                          <Badge tone="success" dot>
+                            Có
+                          </Badge>
+                          <div
+                            className="mt-1 truncate font-mono text-[11px] text-ink-muted"
+                            title={`${profile.proxy.type} · ${profile.proxy.host}:${profile.proxy.port ?? ''}${
+                              profile.proxy.username ? ` · ${profile.proxy.username}` : ''
                             }`}
-                      </span>
+                          >
+                            {profile.proxy.host}:{profile.proxy.port ?? ''}
+                          </div>
+                        </div>
+                      ) : (
+                        <Badge>Không</Badge>
+                      )}
                     </td>
                   ) : null}
                   {show('restore') ? (

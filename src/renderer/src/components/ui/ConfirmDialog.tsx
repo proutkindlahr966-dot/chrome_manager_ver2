@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils'
 export function ConfirmDialog(): JSX.Element | null {
   const confirm = useUiStore((s) => s.confirm)
   const resolveConfirm = useUiStore((s) => s.resolveConfirm)
+  const panelRef = useRef<HTMLDivElement>(null)
   const confirmBtnRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
@@ -12,12 +13,28 @@ export function ConfirmDialog(): JSX.Element | null {
     confirmBtnRef.current?.focus()
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === 'Escape') {
+        e.preventDefault()
         resolveConfirm(false)
         return
       }
       if (e.key === 'Enter' && document.activeElement === confirmBtnRef.current) {
         e.preventDefault()
         resolveConfirm(true)
+        return
+      }
+      if (e.key !== 'Tab' || !panelRef.current) return
+      const focusable = panelRef.current.querySelectorAll<HTMLElement>(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+      )
+      if (!focusable.length) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault()
+        first.focus()
       }
     }
     window.addEventListener('keydown', onKey)
@@ -35,6 +52,7 @@ export function ConfirmDialog(): JSX.Element | null {
         onClick={() => resolveConfirm(false)}
       />
       <div
+        ref={panelRef}
         role="alertdialog"
         aria-modal="true"
         aria-labelledby="confirm-title"

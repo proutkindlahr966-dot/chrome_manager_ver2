@@ -43,7 +43,7 @@ interface AppState {
   createProfile: (input: CreateProfileInput) => Promise<ChromeProfile>
   createProfiles: (input: BulkCreateProfileInput) => Promise<ChromeProfile[]>
   updateProfile: (id: string, input: UpdateProfileInput) => Promise<void>
-  deleteProfiles: (ids: string[]) => Promise<void>
+  deleteProfiles: (ids: string[]) => Promise<BulkResult>
   resetProfile: (id: string) => Promise<void>
   duplicateProfile: (id: string) => Promise<void>
   launchProfiles: (ids: string[]) => Promise<BulkResult>
@@ -73,11 +73,13 @@ const defaultFilters: ProfileFilters = {
   search: '',
   groupId: 'all',
   status: 'all',
+  proxy: 'all',
   sortBy: 'name',
   sortDir: 'asc'
 }
 
 let statsRefreshTimer: ReturnType<typeof setTimeout> | null = null
+let profilesRequestSeq = 0
 
 function scheduleStatsRefresh(get: () => AppState): void {
   if (statsRefreshTimer) return
@@ -99,7 +101,9 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setFilters: (patch) => {
     set((state) => ({ filters: { ...state.filters, ...patch } }))
-    void get().refreshProfiles()
+    void get()
+      .refreshProfiles()
+      .catch(() => undefined)
   },
 
   toggleSelect: (id) => {
@@ -114,8 +118,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   clearError: () => set({ error: null }),
 
   refreshProfiles: async () => {
-    const profiles = await window.api.profiles.list(get().filters)
-    set({ profiles })
+    const requestId = ++profilesRequestSeq
+    const filters = get().filters
+    try {
+      const profiles = await window.api.profiles.list(filters)
+      if (requestId !== profilesRequestSeq) return
+      set({ profiles })
+    } catch (error) {
+      if (requestId !== profilesRequestSeq) return
+      set({
+        error: error instanceof Error ? error.message : 'Không thể tải danh sách hồ sơ'
+      })
+      throw error
+    }
   },
 
   refreshGroups: async () => {
@@ -167,10 +182,28 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   deleteProfiles: async (ids) => {
-    if (ids.length === 1) await window.api.profiles.remove(ids[0])
-    else await window.api.profiles.bulkDelete(ids)
-    get().clearSelection()
+    if (ids.length === 0) return { successIds: [], failed: [] }
+    let result: BulkResult
+    try {
+      result =
+        ids.length === 1
+          ? await window.api.profiles.remove(ids[0]).then(() => ({
+              successIds: [ids[0]],
+              failed: [] as BulkResult['failed']
+            }))
+          : await window.api.profiles.bulkDelete(ids)
+    } catch (error) {
+      await get().refreshProfiles()
+      throw error
+    }
+    const removed = new Set(result.successIds)
+    if (removed.size > 0) {
+      set((state) => ({
+        selectedIds: new Set([...state.selectedIds].filter((id) => !removed.has(id)))
+      }))
+    }
     await get().refreshAll()
+    return result
   },
 
   resetProfile: async (id) => {

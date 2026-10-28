@@ -1,7 +1,8 @@
-import { useEffect } from 'react'
-import { HashRouter, Navigate, Route, Routes } from 'react-router-dom'
+import { useCallback, useEffect, useState } from 'react'
+import { HashRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { AlertCircle, Loader2, X } from 'lucide-react'
 import { Sidebar } from '@/components/layout/Sidebar'
+import { ShortcutsHelpModal } from '@/components/layout/ShortcutsHelpModal'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { ToastHost } from '@/components/ui/ToastHost'
 import { DashboardPage } from '@/pages/DashboardPage'
@@ -9,10 +10,13 @@ import { ProfilesPage } from '@/pages/ProfilesPage'
 import { GroupsPage } from '@/pages/GroupsPage'
 import { GmailPage } from '@/pages/GmailPage'
 import { SettingsPage } from '@/pages/SettingsPage'
+import { WebLinksPage } from '@/pages/WebLinksPage'
 import { useAppStore } from '@/stores/app-store'
 import { useTheme } from '@/hooks/useTheme'
+import { useAppShortcuts } from '@/hooks/useAppShortcuts'
+import { ErrorBoundary } from '@/components/ui/ErrorBoundary'
 
-export default function App(): JSX.Element {
+function AppShell(): JSX.Element {
   const refreshAll = useAppStore((s) => s.refreshAll)
   const applyProfilePatch = useAppStore((s) => s.applyProfilePatch)
   const settings = useAppStore((s) => s.settings)
@@ -21,6 +25,10 @@ export default function App(): JSX.Element {
   const error = useAppStore((s) => s.error)
   const clearError = useAppStore((s) => s.clearError)
   const { theme, mode, setMode } = useTheme(settings?.theme ?? 'system')
+  const [shortcutsOpen, setShortcutsOpen] = useState(false)
+  const openShortcuts = useCallback(() => setShortcutsOpen(true), [])
+  const pathname = useLocation().pathname
+  useAppShortcuts(openShortcuts)
 
   useEffect(() => {
     void refreshAll()
@@ -43,9 +51,14 @@ export default function App(): JSX.Element {
   }
 
   return (
-    <HashRouter>
+    <>
       <div className="flex h-full min-h-0">
-        <Sidebar theme={theme} mode={mode} onCycleTheme={() => void cycleTheme()} />
+        <Sidebar
+          theme={theme}
+          mode={mode}
+          onCycleTheme={() => void cycleTheme()}
+          onOpenShortcuts={() => setShortcutsOpen(true)}
+        />
         <main className="relative min-w-0 flex-1 overflow-auto p-4 md:p-6">
           {loading ? (
             <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-0.5 overflow-hidden bg-accent/20">
@@ -76,18 +89,30 @@ export default function App(): JSX.Element {
             </div>
           ) : null}
 
-          <Routes>
-            <Route path="/" element={<DashboardPage />} />
-            <Route path="/profiles" element={<ProfilesPage />} />
-            <Route path="/groups" element={<GroupsPage />} />
-            <Route path="/gmail" element={<GmailPage />} />
-            <Route path="/settings" element={<SettingsPage />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
+          <ErrorBoundary resetKey={pathname}>
+            <Routes>
+              <Route path="/" element={<DashboardPage />} />
+              <Route path="/profiles" element={<ProfilesPage />} />
+              <Route path="/groups" element={<GroupsPage />} />
+              <Route path="/gmail" element={<GmailPage />} />
+              <Route path="/links" element={<WebLinksPage />} />
+              <Route path="/settings" element={<SettingsPage />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </ErrorBoundary>
         </main>
       </div>
       <ToastHost />
       <ConfirmDialog />
+      <ShortcutsHelpModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+    </>
+  )
+}
+
+export default function App(): JSX.Element {
+  return (
+    <HashRouter>
+      <AppShell />
     </HashRouter>
   )
 }

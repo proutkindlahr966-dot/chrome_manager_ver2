@@ -2,13 +2,37 @@
   "appId": "com.chromemanager.app",
   "productName": "Chrome Manager",
   "directories": {
-    "output": "release"
+    "output": "release",
+    "buildResources": "build"
   },
   "files": [
     "out/**/*",
     "package.json"
   ],
+  "extraResources": [
+    {
+      "from": "build/icon.png",
+      "to": "icon.png"
+    }
+  ],
+  "publish": {
+    "provider": "generic",
+    "url": "https://example.com/chrome-manager-updates/"
+  },
   "win": {
+    "icon": "build/icon.png",
     "target": ["nsis"]
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "allowElevation": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "Chrome Manager",
+    "unicode": true,
+    "installerLanguages": ["en_US"],
+    "artifactName": "${productName}-Setup-${version}.${ext}"
   }
 }

@@ -12,8 +12,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$s.WorkingDirectory = $dir;" ^
   "$s.WindowStyle = 7;" ^
   "$s.Description = 'Chrome Manager';" ^
-  "$exe = Join-Path $dir 'node_modules\electron\dist\electron.exe';" ^
-  "if (Test-Path $exe) { $s.IconLocation = \"$exe,0\" };" ^
+  "$ico = Join-Path $dir 'build\icon.ico';" ^
+  "if (Test-Path $ico) { $s.IconLocation = \"$ico,0\" };" ^
   "$s.Save();" ^
   "Write-Host \"Da tao shortcut: $lnk\""
 if errorlevel 1 (

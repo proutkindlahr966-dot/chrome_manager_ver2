@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   FolderKanban,
   Mail,
+  CalendarDays,
   PlayCircle,
   Plus,
   Square,
@@ -20,6 +21,7 @@ import { formatRelative, statusBadgeTone, statusLabel, cn } from '@/lib/utils'
 
 export function DashboardPage(): JSX.Element {
   const stats = useAppStore((s) => s.stats)
+  const settings = useAppStore((s) => s.settings)
   const groups = useAppStore((s) => s.groups)
   const loading = useAppStore((s) => s.loading)
   const stopProfiles = useAppStore((s) => s.stopProfiles)
@@ -48,6 +50,13 @@ export function DashboardPage(): JSX.Element {
         hint: total ? `${running}/${total} phiên Chrome` : 'Chưa có hồ sơ',
         icon: PlayCircle,
         tone: running > 0 ? 'text-success' : 'text-ink'
+      },
+      {
+        label: 'Chạy hôm nay',
+        value: String(stats?.ranToday ?? 0),
+        hint: `Ngày hôm trước: ${stats?.ranYesterday ?? 0} hồ sơ đã dùng`,
+        icon: CalendarDays,
+        tone: (stats?.ranToday ?? 0) > 0 ? 'text-accent' : 'text-ink'
       },
       {
         label: 'Đã gắn Gmail',
@@ -163,7 +172,16 @@ export function DashboardPage(): JSX.Element {
         }
       />
 
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      {!bootstrapping && settings && !settings.chromePath.trim() ? (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-3 text-sm text-warning">
+          <span>Chưa có đường dẫn Chrome — mở hồ sơ có thể thất bại.</span>
+          <Link to="/settings" className="btn-secondary btn-sm">
+            Mở Cài đặt
+          </Link>
+        </div>
+      ) : null}
+
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
         {cards.map((card) => (
           <div key={card.label} className="panel p-4">
             <div className="flex items-start justify-between gap-3">

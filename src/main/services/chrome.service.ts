@@ -1,4 +1,5 @@
 import { ChildProcess, spawn } from 'child_process'
+import { get as httpGet } from 'http'
 import { createServer } from 'net'
 import {
   existsSync,
@@ -13,6 +14,7 @@ import { BrowserWindow, screen } from 'electron'
 import { getDb } from '../db/database'
 import { IPC } from '../../shared/ipc'
 import { LaunchResult, BulkResult, LaunchOptions, WindowBounds, DEFAULT_USER_AGENT } from '../../shared/types'
+import { runWithConcurrency } from '../../shared/launch-queue'
 import { createAsyncLock, createKeyedAsyncLock } from '../utils/async-lock'
 import { toStatusPatch } from '../utils/profile-sanitize'
 import { chromeUserDataLooksPopulated } from '../utils/data-import-fs'
@@ -26,6 +28,12 @@ interface RunningProcess {
   pid: number
   process: ChildProcess
   debugPort: number
+  watchTimer?: ReturnType<typeof setInterval>
+  emptyPolls?: number
+  downPolls?: number
+  stopping?: boolean
+  /** Thời điểm hết tab/cửa sổ, dùng cho cột Lần chạy. */
+  closedAt?: string
 }
 
 const running = new Map<string, RunningProcess>()
@@ -162,9 +170,79 @@ function prepareChromeSessionPrefs(dataDir: string, restoreLastSession: boolean)
   }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+type CdpPage = import('puppeteer-core').Page
+
+function isBlankStartupUrl(url: string): boolean {
+  const value = (url || '').trim().toLowerCase()
+  return value === '' || value === 'about:blank' || value === 'about:blank/'
+}
+
+async function windowIdOf(page: CdpPage): Promise<number | null> {
+  try {
+    const session = await page.createCDPSession()
+    try {
+      const { windowId } = (await session.send('Browser.getWindowForTarget')) as {
+        windowId: number
+      }
+      return windowId
+    } finally {
+      await session.detach().catch(() => undefined)
+    }
+  } catch {
+    return null
+  }
+}
+
+async function pagesByWindow(browser: import('puppeteer-core').Browser): Promise<Map<number, CdpPage[]>> {
+  const groups = new Map<number, CdpPage[]>()
+  for (const page of await browser.pages()) {
+    const id = await windowIdOf(page)
+    if (id == null) continue
+    const list = groups.get(id) ?? []
+    list.push(page)
+    groups.set(id, list)
+  }
+  return groups
+}
+
+/**
+ * `--restore-last-session` mở cửa sổ tab cũ, còn Chrome vẫn tạo thêm một cửa sổ about:blank.
+ * Chỉ đóng cửa sổ nào toàn about:blank khi đã có cửa sổ tab khác.
+ */
+async function closeStrayBlankWindow(browser: import('puppeteer-core').Browser): Promise<void> {
+  const deadline = Date.now() + 6000
+  while (Date.now() < deadline) {
+    const groups = await pagesByWindow(browser)
+    if (groups.size < 2) {
+      await sleep(200)
+      continue
+    }
+    const entries = [...groups.entries()]
+    const singleBlank = entries.filter(
+      ([, list]) => list.length === 1 && isBlankStartupUrl(list[0].url())
+    )
+    const restored = entries.filter(([id, list]) => {
+      if (singleBlank.some(([blankId]) => blankId === id)) return false
+      return list.length > 1 || list.some((page) => !isBlankStartupUrl(page.url()))
+    })
+    if (singleBlank.length === 0 || restored.length === 0) {
+      await sleep(200)
+      continue
+    }
+    for (const [, list] of singleBlank) {
+      await list[0].close().catch(() => undefined)
+    }
+    return
+  }
+}
+
 /**
  * Sau khi Chrome mở:
- * - Tab cũ bật → giữ nguyên toàn bộ tab đã restore
+ * - Tab cũ bật → một cửa sổ tab đã restore, không kèm cửa sổ about:blank
  * - Tab cũ tắt → chỉ 1 tab (homepage hoặc New Tab)
  */
 async function enforceStartupTabs(
@@ -172,8 +250,6 @@ async function enforceStartupTabs(
   restoreLastSession: boolean,
   startUrl = NEW_TAB_URL
 ): Promise<void> {
-  if (restoreLastSession) return
-
   try {
     const puppeteer = (await import('puppeteer-core')).default
     const browser = await puppeteer.connect({
@@ -182,6 +258,11 @@ async function enforceStartupTabs(
     })
 
     try {
+      if (restoreLastSession) {
+        await closeStrayBlankWindow(browser)
+        return
+      }
+
       const pages = await browser.pages()
       const main = pages[0] ?? (await browser.newPage())
       for (let i = 1; i < pages.length; i++) {
@@ -220,6 +301,84 @@ function emitStatus(profileId: string): void {
   const patch = toStatusPatch(profile)
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send(IPC.PROFILE_STATUS_CHANGED, patch)
+  }
+}
+
+type DebugTarget = { type?: string }
+
+function listDebugTargets(port: number): Promise<DebugTarget[] | null> {
+  return new Promise((resolve) => {
+    const req = httpGet(`http://127.0.0.1:${port}/json/list`, { timeout: 1500 }, (res) => {
+      const chunks: Buffer[] = []
+      res.on('data', (chunk: Buffer) => chunks.push(chunk))
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as DebugTarget[]
+          resolve(Array.isArray(parsed) ? parsed : null)
+        } catch {
+          resolve(null)
+        }
+      })
+    })
+    req.on('error', () => resolve(null))
+    req.on('timeout', () => {
+      req.destroy()
+      resolve(null)
+    })
+  })
+}
+
+/** Chrome có cổng debug thường không thoát khi đóng hết cửa sổ — theo dõi tab/cửa sổ thật. */
+function watchOpenWindows(profileId: string, debugPort: number): void {
+  const entry = running.get(profileId)
+  if (!entry || entry.watchTimer) return
+  entry.watchTimer = setInterval(() => {
+    void pollOpenWindows(profileId, debugPort)
+  }, 2000)
+}
+
+async function pollOpenWindows(profileId: string, debugPort: number): Promise<void> {
+  const entry = running.get(profileId)
+  if (!entry || entry.debugPort !== debugPort) return
+  const targets = await listDebugTargets(debugPort)
+  const current = running.get(profileId)
+  if (!current || current.debugPort !== debugPort || current.stopping) return
+
+  if (!targets) {
+    current.downPolls = (current.downPolls ?? 0) + 1
+    if (!current.closedAt) current.closedAt = new Date().toISOString()
+    if (current.downPolls >= 2) forgetRunningProfile(profileId)
+    return
+  }
+
+  current.downPolls = 0
+  const pages = targets.filter((target) => target.type === 'page')
+  if (pages.length > 0) {
+    current.emptyPolls = 0
+    current.closedAt = undefined
+    return
+  }
+  current.emptyPolls = (current.emptyPolls ?? 0) + 1
+  if (!current.closedAt) current.closedAt = new Date().toISOString()
+  if (current.emptyPolls >= 2) forgetRunningProfile(profileId, true)
+}
+
+function forgetRunningProfile(profileId: string, quitLeftover = false): void {
+  const entry = running.get(profileId)
+  if (!entry) return
+  if (entry.watchTimer) clearInterval(entry.watchTimer)
+  running.delete(profileId)
+  releasePort(entry.debugPort)
+  void stopProxyRelay(profileId)
+  if (quitLeftover) void gracefulCloseChrome(entry.debugPort)
+  try {
+    const closedAt = entry.closedAt ?? new Date().toISOString()
+    const db = getDb()
+    db.noteProfileUsed(profileId, closedAt)
+    db.setProfileStatus(profileId, 'idle', closedAt)
+    emitStatus(profileId)
+  } catch {
+    // hồ sơ có thể đã bị xóa
   }
 }
 
@@ -445,6 +604,7 @@ async function launchProfileUnlocked(
   }
 
   let debugPort: number | undefined
+  let spawned: ChildProcess | null = null
   try {
     db.setProfileStatus(profileId, 'starting')
     emitStatus(profileId)
@@ -499,17 +659,24 @@ async function launchProfileUnlocked(
       args.push(startupUrl)
     }
 
-    const child = spawn(chromePath, args, {
+    spawned = spawn(chromePath, args, {
       detached: true,
       stdio: 'ignore'
     })
+    const child = spawned
+    const spawnFailed = new Promise<never>((_, reject) => {
+      child.once('error', (err) => {
+        reject(err instanceof Error ? err : new Error('Không khởi chạy được Chrome'))
+      })
+    })
+    void spawnFailed.catch(() => undefined)
 
     if (!child.pid) {
       throw new Error('Không thể khởi chạy tiến trình Chrome')
     }
 
     running.set(profileId, { pid: child.pid, process: child, debugPort })
-    await waitForDebugger(debugPort)
+    await Promise.race([waitForDebugger(debugPort), spawnFailed])
 
     // Luồng Login Gmail tự điều hướng — không ép New Tab
     if (!options?.skipHomepage) {
@@ -523,35 +690,52 @@ async function launchProfileUnlocked(
     }
 
     const launched = db.setProfileStatus(profileId, 'running', new Date().toISOString())
+    db.noteProfileUsed(profileId)
     emitStatus(launched.id)
 
     child.on('exit', () => {
-      running.delete(profileId)
-      releasePort(debugPort!)
-      void stopProxyRelay(profileId)
-      try {
-        db.setProfileStatus(profileId, 'idle')
-        emitStatus(profileId)
-      } catch {
-        // profile may have been deleted
-      }
+      forgetRunningProfile(profileId)
     })
+    watchOpenWindows(profileId, debugPort)
 
     child.unref()
 
     return { profileId, success: true, pid: child.pid, debugPort }
   } catch (error) {
+    const entry = running.get(profileId)
+    if (entry?.watchTimer) clearInterval(entry.watchTimer)
     running.delete(profileId)
+    await killSpawnedChrome(entry?.process ?? spawned)
     if (debugPort !== undefined) releasePort(debugPort)
-    void stopProxyRelay(profileId)
-    db.setProfileStatus(profileId, 'error')
-    emitStatus(profileId)
+    await stopProxyRelay(profileId)
+    try {
+      db.setProfileStatus(profileId, 'error')
+      emitStatus(profileId)
+    } catch {
+      // Hồ sơ có thể đã bị xóa trong lúc mở.
+    }
     return {
       profileId,
       success: false,
       error: error instanceof Error ? error.message : 'Lỗi không xác định'
     }
   }
+}
+
+/** Dừng Chrome vừa spawn khi các bước sau (cổng debug, CDP) thất bại — tránh tiến trình mồ côi. */
+async function killSpawnedChrome(child: ChildProcess | null): Promise<void> {
+  if (!child?.pid) return
+  const pid = child.pid
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' })
+    } else {
+      child.kill('SIGKILL')
+    }
+  } catch {
+    // Tiến trình có thể đã thoát.
+  }
+  await waitForPidExit(pid, 4000)
 }
 
 /** Đóng Chrome qua CDP để cookie/session được ghi xuống disk (tránh taskkill /F mất login) */
@@ -601,6 +785,10 @@ async function stopProfileUnlocked(profileId: string): Promise<LaunchResult> {
     return { profileId, success: true }
   }
 
+  entry.stopping = true
+  if (!entry.closedAt) entry.closedAt = new Date().toISOString()
+  if (entry.watchTimer) clearInterval(entry.watchTimer)
+
   try {
     db.setProfileStatus(profileId, 'stopping')
     emitStatus(profileId)
@@ -620,7 +808,9 @@ async function stopProfileUnlocked(profileId: string): Promise<LaunchResult> {
     running.delete(profileId)
     releasePort(entry.debugPort)
     await stopProxyRelay(profileId)
-    db.setProfileStatus(profileId, 'idle')
+    const closedAt = entry.closedAt ?? new Date().toISOString()
+    db.noteProfileUsed(profileId, closedAt)
+    db.setProfileStatus(profileId, 'idle', closedAt)
     emitStatus(profileId)
     return { profileId, success: true, pid: entry.pid }
   } catch (error) {
@@ -637,30 +827,23 @@ async function stopProfileUnlocked(profileId: string): Promise<LaunchResult> {
   }
 }
 
+const BULK_LAUNCH_GAP_MS = 1000
+
 export async function bulkLaunch(ids: string[]): Promise<BulkResult> {
-  const settings = getDb().getSettings()
-  const successIds: string[] = []
   const failed: Array<{ id: string; error: string }> = []
-  // Giữ thứ tự bảng (trên→dưới); mỗi cửa sổ phóng to toàn màn hình — không chia ô
-  const queue = [...ids]
-  const workers = Math.max(1, settings.maxConcurrentLaunches)
-
-  async function worker(): Promise<void> {
-    while (queue.length) {
-      const id = queue.shift()
-      if (!id) break
-      const result = await launchProfile(id, { startMaximized: true })
-      if (result.success) successIds.push(id)
-      else failed.push({ id, error: result.error ?? 'Lỗi' })
-    }
+  const opened = new Set<string>()
+  const limit = Math.min(25, Math.max(1, getDb().getSettings().maxConcurrentLaunches || 5))
+  // Bắt đầu theo thứ tự, cách nhau 1 giây, và không vượt số hồ sơ mở đồng thời trong Cài đặt.
+  await runWithConcurrency(ids, { concurrency: limit, gapMs: BULK_LAUNCH_GAP_MS }, async (id) => {
+    const result = await launchProfile(id, { startMaximized: true })
+    if (result.success) opened.add(id)
+    else failed.push({ id, error: result.error ?? 'Lỗi' })
+  })
+  const successIds = ids.filter((id) => opened.has(id))
+  if (successIds.length) {
+    await maximizeProfileWindows(successIds)
   }
-
-  await Promise.all(Array.from({ length: Math.min(workers, ids.length) }, () => worker()))
-  const orderedOpen = ids.filter((id) => successIds.includes(id))
-  if (orderedOpen.length) {
-    await maximizeProfileWindows(orderedOpen)
-  }
-  return { successIds: orderedOpen, failed }
+  return { successIds, failed }
 }
 
 export async function bulkStop(ids: string[]): Promise<BulkResult> {

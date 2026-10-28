@@ -33,7 +33,8 @@ function encryptGmail(gmail: GmailCredentials | null | undefined): GmailCredenti
     totpSecret: encryptSecret(gmail.totpSecret ?? ''),
     recoveryEmail: gmail.recoveryEmail ?? '',
     email: gmail.email ?? '',
-    raw: gmail.raw ? encryptSecret(gmail.raw) : gmail.raw
+    // `raw` = 4 cột ghép lại → không ghi đĩa, `normalizeGmail` dựng lại khi đọc.
+    raw: undefined
   }
 }
 

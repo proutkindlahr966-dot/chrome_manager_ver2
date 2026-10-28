@@ -15,10 +15,14 @@ import { EmptyState } from '@/components/ui/EmptyState'
 import { ProfileFormModal } from '@/components/profiles/ProfileFormModal'
 import { ProfileTable } from '@/components/profiles/ProfileTable'
 import {
+  DEFAULT_COLUMN_WEIGHTS,
   DEFAULT_VISIBLE_COLUMNS,
+  loadColumnWeights,
   loadVisibleColumns,
   PROFILE_COLUMNS,
+  saveColumnWeights,
   saveVisibleColumns,
+  type ColumnWeights,
   type ProfileColumnId
 } from '@/components/profiles/profile-columns'
 import {
@@ -51,6 +55,8 @@ export function ProfilesPage(): JSX.Element {
   const updateGroup = useAppStore((s) => s.updateGroup)
   const importDataPath = useAppStore((s) => s.importDataPath)
   const [importingData, setImportingData] = useState(false)
+  const busyRef = useRef(false)
+  const [busy, setBusy] = useState<null | 'launch' | 'stop' | 'delete'>(null)
 
   const [formOpen, setFormOpen] = useState(false)
   const [editing, setEditing] = useState<ChromeProfile | null>(null)
@@ -59,6 +65,7 @@ export function ProfilesPage(): JSX.Element {
   const [searchInput, setSearchInput] = useState(filters.search ?? '')
   const debouncedSearch = useDebouncedValue(searchInput, 300)
   const [visibleColumns, setVisibleColumns] = useState<ProfileColumnId[]>(() => loadVisibleColumns())
+  const [columnWeights, setColumnWeights] = useState<ColumnWeights>(() => loadColumnWeights())
   const [columnsOpen, setColumnsOpen] = useState(false)
   const columnsRef = useRef<HTMLDivElement>(null)
   const [pageSize, setPageSize] = useState<ProfilePageSize>(() => loadProfilePageSize())
@@ -73,7 +80,7 @@ export function ProfilesPage(): JSX.Element {
   // Đổi bộ lọc / sắp xếp → về trang 1
   useEffect(() => {
     setPage(1)
-  }, [filters.search, filters.groupId, filters.status, filters.sortBy, filters.sortDir])
+  }, [filters.search, filters.groupId, filters.status, filters.proxy, filters.sortBy, filters.sortDir])
 
   const totalPages = Math.max(1, Math.ceil(profiles.length / pageSize))
   const safePage = Math.min(page, totalPages)
@@ -133,6 +140,15 @@ export function ProfilesPage(): JSX.Element {
     setVisibleColumns(next)
   }
 
+  function commitColumnWeights(next: ColumnWeights): void {
+    setColumnWeights(next)
+    saveColumnWeights(next)
+  }
+
+  function resetColumnWidths(): void {
+    commitColumnWeights({ ...DEFAULT_COLUMN_WEIGHTS })
+  }
+
   const selectedList = useMemo(
     () => profiles.filter((p) => selectedIds.has(p.id)).map((p) => p.id),
     [profiles, selectedIds]
@@ -164,7 +180,8 @@ export function ProfilesPage(): JSX.Element {
     return Boolean(
       (filters.search ?? '').trim() ||
         (filters.groupId && filters.groupId !== 'all') ||
-        (filters.status && filters.status !== 'all')
+        (filters.status && filters.status !== 'all') ||
+        (filters.proxy && filters.proxy !== 'all')
     )
   }, [filters])
 
@@ -202,7 +219,7 @@ export function ProfilesPage(): JSX.Element {
 
   function clearFilters(): void {
     setSearchInput('')
-    setFilters({ search: '', groupId: 'all', status: 'all' })
+    setFilters({ search: '', groupId: 'all', status: 'all', proxy: 'all' })
   }
 
   function reportBulkResult(
@@ -232,31 +249,83 @@ export function ProfilesPage(): JSX.Element {
     })
   }
 
-  async function handleLaunch(ids: string[]): Promise<void> {
+  async function runExclusive(
+    kind: 'launch' | 'stop' | 'delete',
+    fn: () => Promise<void>
+  ): Promise<void> {
+    if (busyRef.current) {
+      toast({ tone: 'info', title: 'Đang xử lý hồ sơ, hãy đợi thao tác hiện tại xong' })
+      return
+    }
+    busyRef.current = true
+    setBusy(kind)
     try {
-      const result = await launchProfiles(ids)
-      reportBulkResult('mở', result, ids.length)
-    } catch (error) {
-      toast({
-        tone: 'error',
-        title: 'Không thể mở hồ sơ',
-        description: error instanceof Error ? error.message : undefined
-      })
+      await fn()
+    } finally {
+      busyRef.current = false
+      setBusy(null)
     }
   }
 
-  async function handleStop(ids: string[]): Promise<void> {
-    try {
-      const result = await stopProfiles(ids)
-      reportBulkResult('đóng', result, ids.length)
-    } catch (error) {
-      toast({
-        tone: 'error',
-        title: 'Không thể đóng hồ sơ',
-        description: error instanceof Error ? error.message : undefined
-      })
-    }
+  async function handleLaunch(ids: string[]): Promise<void> {
+    await runExclusive('launch', async () => {
+      try {
+        const result = await launchProfiles(ids)
+        reportBulkResult('mở', result, ids.length)
+      } catch (error) {
+        toast({
+          tone: 'error',
+          title: 'Không thể mở hồ sơ',
+          description: error instanceof Error ? error.message : undefined
+        })
+      }
+    })
   }
+
+  async function handleStop(ids: string[]): Promise<void> {
+    await runExclusive('stop', async () => {
+      try {
+        const result = await stopProfiles(ids)
+        reportBulkResult('đóng', result, ids.length)
+      } catch (error) {
+        toast({
+          tone: 'error',
+          title: 'Không thể đóng hồ sơ',
+          description: error instanceof Error ? error.message : undefined
+        })
+      }
+    })
+  }
+
+  useEffect(() => {
+    const onNew = (): void => {
+      setEditing(null)
+      setFormOpen(true)
+    }
+    const onLaunch = (): void => {
+      if (selectedList.length === 0) {
+        toast({ tone: 'warning', title: 'Chọn ít nhất một hồ sơ để mở' })
+        return
+      }
+      void handleLaunch(selectedList)
+    }
+    const onStop = (): void => {
+      const ids = [...selectedIds]
+      if (ids.length === 0) {
+        toast({ tone: 'warning', title: 'Chọn ít nhất một hồ sơ để đóng' })
+        return
+      }
+      void handleStop(ids)
+    }
+    window.addEventListener('cm:new-profile', onNew)
+    window.addEventListener('cm:launch-selected', onLaunch)
+    window.addEventListener('cm:stop-selected', onStop)
+    return () => {
+      window.removeEventListener('cm:new-profile', onNew)
+      window.removeEventListener('cm:launch-selected', onLaunch)
+      window.removeEventListener('cm:stop-selected', onStop)
+    }
+  }, [selectedIds, selectedList])
 
   async function confirmDelete(ids: string[]): Promise<void> {
     if (!ids.length) return
@@ -268,8 +337,37 @@ export function ProfilesPage(): JSX.Element {
       danger: true
     })
     if (!ok) return
-    await deleteProfiles(ids)
-    toast({ tone: 'success', title: ids.length === 1 ? 'Đã xóa hồ sơ' : `Đã xóa ${ids.length} hồ sơ` })
+    await runExclusive('delete', async () => {
+      try {
+        const result = await deleteProfiles(ids)
+        if (result.failed.length === 0) {
+          toast({
+            tone: 'success',
+            title: ids.length === 1 ? 'Đã xóa hồ sơ' : `Đã xóa ${result.successIds.length} hồ sơ`
+          })
+          return
+        }
+        if (result.successIds.length === 0) {
+          toast({
+            tone: 'error',
+            title: 'Không thể xóa hồ sơ',
+            description: result.failed[0]?.error
+          })
+          return
+        }
+        toast({
+          tone: 'warning',
+          title: `Đã xóa ${result.successIds.length}/${ids.length} hồ sơ`,
+          description: result.failed[0]?.error
+        })
+      } catch (error) {
+        toast({
+          tone: 'error',
+          title: 'Không thể xóa hồ sơ',
+          description: error instanceof Error ? error.message : undefined
+        })
+      }
+    })
   }
 
   async function handleWipeProfile(id: string): Promise<void> {
@@ -379,13 +477,16 @@ export function ProfilesPage(): JSX.Element {
               className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink-muted"
             />
             <input
+              id="profile-search"
+              type="search"
+              aria-label="Tìm hồ sơ"
               className="input pl-9"
               placeholder="Tìm theo tên, UUID, ghi chú, tag, gmail..."
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
             />
           </div>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6 lg:w-auto lg:shrink-0">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-7 lg:w-auto lg:shrink-0">
             <select
               className="input"
               value={filters.groupId ?? 'all'}
@@ -410,6 +511,17 @@ export function ProfilesPage(): JSX.Element {
               <option value="idle">Sẵn sàng</option>
               <option value="running">Đang chạy</option>
               <option value="error">Lỗi</option>
+            </select>
+            <select
+              className="input"
+              value={filters.proxy ?? 'all'}
+              onChange={(e) =>
+                setFilters({ proxy: e.target.value as typeof filters.proxy })
+              }
+            >
+              <option value="all">Mọi proxy</option>
+              <option value="with">Có proxy</option>
+              <option value="without">Không proxy</option>
             </select>
             <select
               className="input"
@@ -494,13 +606,20 @@ export function ProfilesPage(): JSX.Element {
                       )
                     })}
                   </ul>
-                  <div className="mt-1.5 border-t border-line pt-1.5">
+                  <div className="mt-1.5 space-y-0.5 border-t border-line pt-1.5">
                     <button
                       type="button"
                       className="btn-ghost btn-sm w-full justify-center text-ink-soft"
                       onClick={resetColumns}
                     >
                       Hiện tất cả
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-ghost btn-sm w-full justify-center text-ink-soft"
+                      onClick={resetColumnWidths}
+                    >
+                      Đặt lại độ rộng
                     </button>
                   </div>
                 </div>
@@ -531,7 +650,10 @@ export function ProfilesPage(): JSX.Element {
       </div>
 
       {selectedList.length > 0 ? (
-        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-xl border border-accent/30 bg-accent-soft px-3 py-2.5">
+        <div
+          className="mb-4 flex flex-wrap items-center gap-2 rounded-xl border border-accent/30 bg-accent-soft px-3 py-2.5"
+          aria-busy={busy !== null}
+        >
           <span className="mr-1 text-sm font-medium text-accent-strong">
             Đã chọn {selectedList.length}
           </span>
@@ -539,22 +661,25 @@ export function ProfilesPage(): JSX.Element {
           <button
             type="button"
             className="btn-secondary btn-sm"
+            disabled={busy !== null}
             onClick={() => void handleLaunch(selectedList)}
           >
             <Play size={14} />
-            Mở
+            {busy === 'launch' ? 'Đang mở...' : 'Mở'}
           </button>
           <button
             type="button"
             className="btn-secondary btn-sm"
+            disabled={busy !== null}
             onClick={() => void handleStop(selectedList)}
           >
             <Square size={14} />
-            Đóng
+            {busy === 'stop' ? 'Đang đóng...' : 'Đóng'}
           </button>
           <button
             type="button"
             className="btn-secondary btn-sm"
+            disabled={busy !== null}
             onClick={() => setMoveOpen(true)}
           >
             <FolderInput size={14} />
@@ -563,10 +688,11 @@ export function ProfilesPage(): JSX.Element {
           <button
             type="button"
             className="btn-danger btn-sm"
+            disabled={busy !== null}
             onClick={() => void confirmDelete(selectedList)}
           >
             <Trash2 size={14} />
-            Xóa
+            {busy === 'delete' ? 'Đang xóa...' : 'Xóa'}
           </button>
           <button type="button" className="btn-ghost btn-sm ml-auto" onClick={clearSelection}>
             Bỏ chọn
@@ -605,6 +731,8 @@ export function ProfilesPage(): JSX.Element {
             groups={groups}
             selectedIds={selectedIds}
             visibleColumns={visibleColumns}
+            columnWeights={columnWeights}
+            onColumnWeightsChange={commitColumnWeights}
             onToggle={toggleSelect}
             onSelectAll={() => {
               const allSelected = pageProfiles.every((p) => selectedIds.has(p.id))

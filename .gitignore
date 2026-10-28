@@ -7,6 +7,8 @@ data/**
 Chrome Manager.lnk
 *.tsbuildinfo
 *.log
+# Dump chẩn đoán tạm ở thư mục gốc
+/_*.txt
 .DS_Store
 .env
 .env.*

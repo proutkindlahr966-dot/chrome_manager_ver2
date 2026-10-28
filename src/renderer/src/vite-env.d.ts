@@ -10,6 +10,7 @@ import type {
   GmailLoginOptions,
   GmailLoginProgress,
   GmailPostSetupConfig,
+  DrivePdfLaneInfo,
   ImagePreview,
   LaunchResult,
   ProfileFilters,
@@ -21,6 +22,9 @@ import type {
 } from '@shared/types'
 import type { ImportGroupsResult } from '@shared/group-import'
 import type { DataImportPreview, DataImportResult } from '@shared/data-import'
+import type { DiskSpaceInfo } from '@shared/disk'
+import type { DbBackupInfo, UpdateCheckResult } from '@shared/app-ops'
+import type { WebLinkCheckProgress, WebLinkCheckResult, UrlListCheckResult } from '@shared/web-link'
 
 export interface AppApi {
   profiles: {
@@ -51,7 +55,9 @@ export interface AppApi {
     saveGmailSetup: (
       config: GmailPostSetupConfig
     ) => Promise<{ path: string; config: GmailPostSetupConfig }>
+    listDrivePdfLanes: () => Promise<DrivePdfLaneInfo[]>
     pickImageFile: () => Promise<string | null>
+    pickPdfFile: () => Promise<string | null>
     readImagePreview: (path: string) => Promise<ImagePreview>
     pickScriptTextFile: () => Promise<string | null>
     onStatusChanged: (cb: (patch: ProfileStatusPatch) => void) => () => void
@@ -80,6 +86,30 @@ export interface AppApi {
     get: () => Promise<AppSettings>
     update: (patch: Partial<AppSettings>) => Promise<AppSettings>
     detectChrome: () => Promise<string>
+    pickProfilesDir: () => Promise<string | null>
+    diskSpace: (paths?: string[]) => Promise<DiskSpaceInfo[]>
+    openPath: (targetPath: string) => Promise<{ ok: true } | { ok: false; error: string }>
+  }
+  app: {
+    info: () => Promise<{ name: string; version: string; packaged: boolean; backupDir: string }>
+    checkUpdates: (feedUrl?: string) => Promise<UpdateCheckResult>
+    installUpdate: (feedUrl?: string) => Promise<{ ok: true } | { ok: false; error: string }>
+  }
+  backup: {
+    list: () => Promise<DbBackupInfo[]>
+    exportFile: () => Promise<string | null>
+    restoreFile: () => Promise<{ profiles: number; groups: number } | null>
+    restoreNamed: (filePath: string) => Promise<{ profiles: number; groups: number }>
+  }
+  webLinks: {
+    load: () => Promise<{ content: string; path: string }>
+    save: (content: string) => Promise<{ path: string; count: number }>
+    check: (content: string, target?: 'web' | 'form') => Promise<WebLinkCheckResult>
+    checkList: (content: string, target?: 'all' | 'web' | 'form') => Promise<UrlListCheckResult>
+    cancel: () => Promise<boolean>
+    pickFile: () => Promise<string | null>
+    exportFile: (content: string) => Promise<string | null>
+    onProgress: (cb: (progress: WebLinkCheckProgress) => void) => () => void
   }
 }
 

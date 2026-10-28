@@ -1,11 +1,13 @@
 ﻿import { clipboard } from 'electron'
-import { existsSync, readFileSync } from 'fs'
-import { basename, isAbsolute, resolve } from 'path'
+import { existsSync, readFileSync, readdirSync, statSync } from 'fs'
+import { basename, isAbsolute, join, resolve } from 'path'
 import type { Browser, ElementHandle, Frame, Page, Target } from 'puppeteer-core'
-import type { FormLinkStyle, GmailLoginOptions } from '../../shared/types'
+import type { DrivePdfLaneInfo, FormLinkStyle, GmailLoginOptions } from '../../shared/types'
+import { getDataRoot } from '../utils/paths'
 import { resolveAppsScriptCode } from './gmail-list.service'
 import { changeAvatar } from './gmail-avatar.service'
 import { createAsyncLock } from './async-lock'
+import { pacedMs } from './step-pace'
 
 const SHEET_CREATE_URL = 'https://docs.google.com/spreadsheets/u/0/create'
 const FORM_CREATE_URL =
@@ -19,22 +21,76 @@ const withClipboard = createAsyncLock()
 const withFormLinkUi = createAsyncLock()
 
 export interface PostSetupStepResult {
-  step: 'avatar' | 'sheet' | 'form' | 'script' | '2fa-live'
+  step: 'avatar' | 'sheet' | 'form' | 'script' | '2fa-live' | 'drive'
   ok: boolean
   detail: string
   /** URL Spreadsheet vừa tạo (nếu step=sheet) */
   sheetUrl?: string
   /** URL Form công khai (sau Publish / viewform) */
   formUrl?: string
+  /** Link Share của PDF vừa upload lên Drive */
+  pdfUrl?: string
   /** Mã 6 số lấy từ 2fa.live */
   twoFaCode?: string
 }
 
 const LINK_SHEET_TOKEN = '[LINK_SHEET]'
 const LINK_FORM_TOKEN = '[LINK_FORM]'
+const LINK_PDF_TOKEN = '[LINK_PDF]'
+const DRIVE_MY_DRIVE_URL = 'https://drive.google.com/drive/u/0/my-drive'
+const DRIVE_PDF_LANE_COUNT = 10
+
+function drivePdfRoot(): string {
+  return join(getDataRoot(), 'File_PDF')
+}
+
+function firstPdfInDir(dir: string): string {
+  if (!existsSync(dir)) return ''
+  let names: string[] = []
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return ''
+  }
+  const pdfs = names.filter((name) => {
+    if (!name.toLowerCase().endsWith('.pdf')) return false
+    try {
+      return statSync(join(dir, name)).isFile()
+    } catch {
+      return false
+    }
+  })
+  pdfs.sort((a, b) => a.localeCompare(b, 'en'))
+  return pdfs[0] ?? ''
+}
+
+export function listDrivePdfLanes(): DrivePdfLaneInfo[] {
+  const root = drivePdfRoot()
+  const out: DrivePdfLaneInfo[] = []
+  for (let lane = 1; lane <= DRIVE_PDF_LANE_COUNT; lane += 1) {
+    const folder = `Lan${lane}`
+    out.push({ lane, folder, fileName: firstPdfInDir(join(root, folder)) })
+  }
+  return out
+}
+
+export function resolveDrivePdfForLane(
+  lane: number
+): { path: string; folder: string; fileName: string } | { error: string } {
+  if (!Number.isInteger(lane) || lane < 1 || lane > DRIVE_PDF_LANE_COUNT) {
+    return { error: `Folder PDF của hồ sơ không khớp Lan1–Lan${DRIVE_PDF_LANE_COUNT}.` }
+  }
+  const folder = `Lan${lane}`
+  const dir = join(drivePdfRoot(), folder)
+  const fileName = firstPdfInDir(dir)
+  if (!fileName) {
+    return { error: `${folder} chưa có file PDF trong data/File_PDF/${folder}.` }
+  }
+  return { path: join(dir, fileName), folder, fileName }
+}
 
 async function delay(ms: number): Promise<void> {
-  await new Promise((r) => setTimeout(r, ms))
+  await new Promise((r) => setTimeout(r, pacedMs(ms)))
 }
 
 /** Gắn helper cuộn vào viewport — cửa sổ chia ô nhỏ hay cắt nút dưới fold. */
@@ -180,7 +236,7 @@ async function waitForFormEditorReady(page: Page, timeoutMs = 20000): Promise<bo
   const probe = () =>
     Boolean(
       document.querySelector(
-        '[aria-label="Form title"], [aria-label="Untitled form"], [aria-label="Form description"], [guidedhelpid="publishGH"], [data-action-id="freebird-publish-dialog"], div[contenteditable="true"]'
+        '[aria-label="Form title"], [aria-label="Untitled form"], [aria-label="Form description"], [guidedhelpid="publishGH"], [data-action-id="freebird-publish-dialog"], div[jsname="yrriRe"][role="textbox"], div[contenteditable="true"]'
       )
     )
   while (Date.now() - started < timeoutMs) {
@@ -219,7 +275,12 @@ function matchesFormLinkStyle(url: string, style: FormLinkStyle): boolean {
 }
 
 function cleanFormUrl(url: string): string {
-  return url.trim().split(/\s+/)[0].split('#')[0].replace(/[.,;)]+$/, '')
+  const raw = url.trim().split(/\s+/)[0].replace(/[.,;)]+$/, '')
+  const viewform = raw.match(
+    /^(https?:\/\/docs\.google\.com\/forms\/d\/(?:e\/)?[a-zA-Z0-9_-]+\/viewform)/i
+  )
+  if (viewform?.[1]) return viewform[1]
+  return raw.split('#')[0]
 }
 
 type ResponderPanelSnap = {
@@ -466,11 +527,7 @@ async function resolveShortFormToLong(shortUrl: string): Promise<string | null> 
   try {
     const res = await fetch(shortUrl, { method: 'GET', redirect: 'follow' })
     const finalUrl = cleanFormUrl(res.url || '')
-    if (isLongFormUrl(finalUrl)) {
-      // Giữ viewform sạch (bỏ query tracking nếu có thể)
-      const bare = finalUrl.replace(/\?.*$/, '')
-      return /\/viewform$/i.test(bare) ? bare : finalUrl
-    }
+    if (isLongFormUrl(finalUrl)) return finalUrl
   } catch {
     // ignore
   }
@@ -2161,71 +2218,42 @@ async function publishAndGetFormLink(
 }
 
 /** Điền 1 ô contenteditable / textarea trên Google Forms editor */
-async function fillFormEditable(
-  page: Page,
-  selectors: string[],
-  value: string
-): Promise<boolean> {
-  const text = value.trim()
-  if (!text) return false
+const FORM_TITLE_SELECTORS = [
+  '[data-cm-field="title"]',
+  '[jsname="GYcwYe"] div[jsname="yrriRe"][role="textbox"]',
+  '[jsname="GYcwYe"] [role="textbox"]',
+  '[aria-label="Form title"]',
+  '[aria-label="Untitled form"]',
+  '[aria-label="Tiêu đề biểu mẫu"]',
+  '[aria-label="Biểu mẫu không có tiêu đề"]',
+  'textarea[aria-label="Form title"]',
+  'div[aria-label="Form title"][contenteditable="true"]',
+  'input[aria-label="Form title"]'
+]
 
-  for (const selector of selectors) {
-    const handle = await page.$(selector).catch(() => null)
-    if (!handle) continue
+const BOLD_BUTTON_LABELS = ['bold', 'đậm', 'in đậm', 'negrito', 'negrita', 'gras', 'fett']
 
-    try {
-      const viaDom = await page.evaluate(
-        (sel, expected) => {
-          const el = document.querySelector(sel) as HTMLElement | null
-          if (!el) return false
-          const w = window as Window & { __cmReveal?: (el: HTMLElement) => boolean }
-          if (typeof w.__cmReveal === 'function') w.__cmReveal(el)
-          else {
-            try {
-              el.scrollIntoView({ block: 'center', inline: 'nearest' })
-            } catch {
-              // ignore
-            }
-          }
-          el.click()
-          el.focus()
-          if ('value' in el) {
-            const proto = Object.getOwnPropertyDescriptor(
-              window.HTMLTextAreaElement.prototype,
-              'value'
-            )
-            proto?.set?.call(el, expected)
-            ;(el as HTMLTextAreaElement).value = expected
-          } else {
-            el.textContent = expected
-            el.innerText = expected
-          }
-          el.dispatchEvent(new InputEvent('input', { bubbles: true, data: expected }))
-          el.dispatchEvent(new Event('change', { bubbles: true }))
-          el.dispatchEvent(new Event('blur', { bubbles: true }))
-          const current = (el.textContent || (el as HTMLTextAreaElement).value || '').trim()
-          return current.includes(expected.trim()) || current === expected.trim()
-        },
-        selector,
-        text
-      )
-      if (viaDom) return true
-    } catch {
-      // thử selector tiếp
-    }
+async function pressCtrlKey(page: Page, key: 'KeyA' | 'KeyB'): Promise<void> {
+  await page.keyboard.down('Control')
+  try {
+    await page.keyboard.press(key)
+  } finally {
+    await page.keyboard.up('Control')
   }
-  return false
 }
 
-/** Placeholder "Form description" thường không phải role=button — phải click rồi insertText. */
-async function fillFormDescriptionField(page: Page, value: string): Promise<boolean> {
-  const text = value.trim()
-  if (!text) return false
-  const needles = ['form description', 'mô tả biểu mẫu', 'description', 'mô tả']
-
+/**
+ * Tọa độ giữa ô tiêu đề hoặc ô mô tả — chỉ nhận contenteditable/textarea đúng nhãn,
+ * không nhận khối cha chứa cả hai ô (click lệch sẽ dán mô tả vào Untitled form).
+ */
+async function locateFormEditablePoint(
+  page: Page,
+  kind: 'title' | 'description'
+): Promise<ClickPoint | null> {
+  await installViewportHelpers(page)
   for (const frame of framesOf(page)) {
-    const clicked = await frame
-      .evaluate((labels) => {
+    const local = await frame
+      .evaluate((descLabels: string[], want: 'title' | 'description') => {
         const reveal = (el: HTMLElement): void => {
           const w = window as Window & { __cmReveal?: (el: HTMLElement) => boolean }
           if (typeof w.__cmReveal === 'function') w.__cmReveal(el)
@@ -2237,121 +2265,799 @@ async function fillFormDescriptionField(page: Page, value: string): Promise<bool
             }
           }
         }
-        const ownText = (el: HTMLElement): string => {
-          const bits: string[] = []
-          for (const n of Array.from(el.childNodes)) {
-            if (n.nodeType === Node.TEXT_NODE) bits.push(n.textContent || '')
-          }
-          return bits.join('').replace(/\s+/g, ' ').trim().toLowerCase()
-        }
-        const nodes = Array.from(
-          document.querySelectorAll(
-            '[aria-label], [aria-placeholder], [contenteditable="true"], textarea, div, span, [role="textbox"]'
-          )
-        ) as HTMLElement[]
-        const hits: Array<{ el: HTMLElement; score: number }> = []
-        for (const el of nodes) {
-          const label = (
+        const norm = (value: string | null | undefined): string =>
+          (value || '').replace(/\s+/g, ' ').trim().toLowerCase()
+        const labelOf = (el: HTMLElement): string =>
+          norm(
             el.getAttribute('aria-label') ||
-            el.getAttribute('aria-placeholder') ||
-            el.getAttribute('placeholder') ||
-            ownText(el) ||
-            ''
+              el.getAttribute('aria-placeholder') ||
+              el.getAttribute('data-placeholder') ||
+              el.getAttribute('placeholder')
           )
-            .replace(/\s+/g, ' ')
-            .trim()
-            .toLowerCase()
-          if (!label || label.length > 48) continue
-          if (!labels.some((n) => label === n || label.startsWith(n))) continue
-          const inner = (el.innerText || '').replace(/\s+/g, ' ').trim()
-          if (inner.length > 80) continue
-          reveal(el)
-          const r = el.getBoundingClientRect()
-          if (r.width < 8 || r.height < 4) continue
-          let score = label.length
-          if (el.isContentEditable || el.tagName === 'TEXTAREA') score -= 20
-          hits.push({ el, score })
+        const isTitleLabel = (label: string): boolean => {
+          if (!label) return false
+          if (label.includes('description') || label.includes('mô tả') || label.includes('descri')) {
+            return false
+          }
+          return (
+            label === 'form title' ||
+            label === 'untitled form' ||
+            label.startsWith('form title') ||
+            label.startsWith('untitled form') ||
+            label === 'tiêu đề biểu mẫu' ||
+            label === 'biểu mẫu không có tiêu đề'
+          )
         }
-        hits.sort((a, b) => a.score - b.score)
-        if (!hits[0]) return false
-        const el = hits[0].el
-        reveal(el)
-        el.click()
-        el.focus()
-        return true
-      }, needles)
-      .catch(() => false)
-    if (clicked) break
+        const isDescLabel = (label: string): boolean =>
+          Boolean(label) && descLabels.some((needle) => label === needle || label.startsWith(needle))
+        const nodes = Array.from(
+          document.querySelectorAll('[contenteditable], textarea, input, [role="textbox"]')
+        ) as HTMLElement[]
+        const hits: Array<{ x: number; y: number; area: number }> = []
+        for (const el of nodes) {
+          const label = labelOf(el)
+          const shown = norm(el.innerText || (el as HTMLTextAreaElement).value)
+          const title = isTitleLabel(label)
+          const description =
+            isDescLabel(label) ||
+            (el.isContentEditable && descLabels.some((needle) => shown === needle))
+          const matched = want === 'title' ? title && !description : description && !title
+          if (!matched) continue
+          if (want === 'description' && el.querySelector('[aria-label="Form title"], [aria-label="Untitled form"]')) {
+            continue
+          }
+          if (want === 'title' && el.querySelector('[aria-label="Form description"]')) continue
+          reveal(el)
+          const rect = el.getBoundingClientRect()
+          const maxHeight = want === 'description' ? 240 : 96
+          if (rect.width < 40 || rect.height < 10 || rect.height > maxHeight) continue
+          hits.push({
+            x: rect.left + rect.width / 2,
+            y: rect.top + rect.height / 2,
+            area: rect.width * rect.height
+          })
+        }
+        hits.sort((a, b) => a.area - b.area)
+        return hits[0] ? { x: hits[0].x, y: hits[0].y } : null
+      }, FORM_DESCRIPTION_LABELS, kind)
+      .catch(() => null)
+    if (!local) continue
+    const offset = await frameViewportOffset(page, frame)
+    return { x: local.x + offset.x, y: local.y + offset.y }
   }
+  return null
+}
 
-  await delay(250)
-
+/** Lấy đúng node tiêu đề / mô tả. Ô Form thường cao hơn 96px nên không loại theo chiều cao hẹp. */
+async function pickFormField(
+  page: Page,
+  kind: 'title' | 'description'
+): Promise<ElementHandle<Element> | null> {
+  await installViewportHelpers(page)
   for (const frame of framesOf(page)) {
-    const typed = await frame
-      .evaluate((expected) => {
-        const el = document.activeElement as HTMLElement | null
-        const targets: HTMLElement[] = []
-        if (el) targets.push(el)
-        targets.push(
-          ...Array.from(
-            document.querySelectorAll(
-              '[aria-label="Form description"], [aria-label="Mô tả biểu mẫu"], [aria-label="Description"], textarea[aria-label*="description" i], [contenteditable="true"][aria-label*="description" i]'
-            )
-          ).map((n) => n as HTMLElement)
-        )
-        const write = (node: HTMLElement): boolean => {
-          node.focus()
-          try {
-            document.execCommand('selectAll', false)
-          } catch {
-            // ignore
-          }
-          let ok = false
-          try {
-            ok = document.execCommand('insertText', false, expected)
-          } catch {
-            ok = false
-          }
-          if (!ok) {
-            if ('value' in node) {
-              const proto = Object.getOwnPropertyDescriptor(
-                window.HTMLTextAreaElement.prototype,
-                'value'
-              )
-              proto?.set?.call(node, expected)
-              ;(node as HTMLTextAreaElement).value = expected
-            } else {
-              node.textContent = expected
+    const handle = await frame
+      .evaluateHandle((descLabels: string[], want: 'title' | 'description') => {
+        const reveal = (el: HTMLElement): void => {
+          const w = window as Window & { __cmReveal?: (el: HTMLElement) => boolean }
+          if (typeof w.__cmReveal === 'function') w.__cmReveal(el)
+          else {
+            try {
+              el.scrollIntoView({ block: 'center', inline: 'nearest' })
+            } catch {
+              // ignore
             }
           }
-          node.dispatchEvent(
-            new InputEvent('input', { bubbles: true, data: expected, inputType: 'insertText' })
-          )
-          node.dispatchEvent(new Event('change', { bubbles: true }))
-          const current = (node.textContent || (node as HTMLTextAreaElement).value || '').trim()
-          return current.includes(expected.trim())
         }
-        for (const node of targets) {
-          if (write(node)) return true
+        const norm = (value: string | null | undefined): string =>
+          (value || '').replace(/\s+/g, ' ').trim().toLowerCase()
+        const labelOf = (el: HTMLElement): string => {
+          const direct = norm(
+            el.getAttribute('aria-label') ||
+              el.getAttribute('aria-placeholder') ||
+              el.getAttribute('data-placeholder') ||
+              el.getAttribute('placeholder')
+          )
+          if (direct === 'document title') return ''
+          if (direct) return direct
+          const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+          for (const id of ids) {
+            const node = document.getElementById(id)
+            const text = norm(node?.innerText || node?.textContent)
+            if (text) return text
+          }
+          const box = el.closest('[jsname="GYcwYe"], [jsname="NorrI"], .KCm9Q') as HTMLElement | null
+          const hidden = box?.querySelector('[jsname="V67aGc"]') as HTMLElement | null
+          return norm(hidden?.innerText || hidden?.textContent)
+        }
+        const isTitleLabel = (label: string): boolean => {
+          if (!label || label === 'document title') return false
+          if (label.includes('description') || label.includes('mô tả') || label.includes('descri')) {
+            return false
+          }
+          return (
+            label === 'form title' ||
+            label === 'untitled form' ||
+            label.startsWith('form title') ||
+            label.startsWith('untitled form') ||
+            label === 'tiêu đề biểu mẫu' ||
+            label === 'biểu mẫu không có tiêu đề'
+          )
+        }
+        const isDescLabel = (label: string): boolean =>
+          Boolean(label) && descLabels.some((needle) => label === needle || label.startsWith(needle))
+        const nodes = Array.from(
+          document.querySelectorAll(
+            'div[jsname="yrriRe"][role="textbox"], [role="textbox"], [contenteditable], textarea'
+          )
+        ) as HTMLElement[]
+        const hits: Array<{ el: HTMLElement; area: number; score: number }> = []
+        for (const el of nodes) {
+          if (norm(el.getAttribute('aria-label')) === 'document title') continue
+          if (el.closest('.wPVTLe, .LIkguc, header#gb')) continue
+          const inner = el.matches('[jsname="yrriRe"], [role="textbox"], [contenteditable], textarea')
+            ? el
+            : ((el.querySelector(
+                '[jsname="yrriRe"][role="textbox"], [contenteditable], textarea, [role="textbox"]'
+              ) as HTMLElement | null) ?? el)
+          const inTitleBox = Boolean(inner.closest('[jsname="GYcwYe"]'))
+          const inDescBox = Boolean(inner.closest('[jsname="NorrI"]'))
+          const label = labelOf(inner)
+          const title = inTitleBox || isTitleLabel(label)
+          const description = inDescBox || isDescLabel(label)
+          const matched = want === 'title' ? title && !description : description && !title
+          if (!matched) continue
+          reveal(inner)
+          const rect = inner.getBoundingClientRect()
+          if (rect.width < 30 || rect.height < 8 || rect.height > 360) continue
+          const score = (want === 'title' && inTitleBox) || (want === 'description' && inDescBox) ? 0 : 1
+          hits.push({ el: inner, area: rect.width * rect.height, score })
+        }
+        hits.sort((a, b) => a.score - b.score || a.area - b.area)
+        return hits[0]?.el ?? null
+      }, FORM_DESCRIPTION_LABELS, kind)
+      .catch(() => null)
+    if (!handle) continue
+    const element = handle.asElement()
+    if (!element) {
+      await handle.dispose().catch(() => undefined)
+      continue
+    }
+    return element as ElementHandle<Element>
+  }
+  return null
+}
+
+async function fieldContainsFocus(field: ElementHandle<Element>): Promise<boolean> {
+  return field
+    .evaluate((el) => {
+      const active = document.activeElement
+      return active === el || el.contains(active)
+    })
+    .catch(() => false)
+}
+
+/** Click đúng node. Mô tả chỉ được focus sau khi đã mở header bằng click tiêu đề. */
+async function focusFormEditable(
+  page: Page,
+  kind: 'title' | 'description'
+): Promise<'ok' | 'no-field' | 'no-focus'> {
+  await page.bringToFront().catch(() => undefined)
+  if (kind === 'description') {
+    const title = await pickFormField(page, 'title')
+    if (title) {
+      await title
+        .evaluate((el) => {
+          ;(el as HTMLElement).setAttribute('data-cm-field', 'title')
+        })
+        .catch(() => undefined)
+      await title.click({ delay: 30 }).catch(() => undefined)
+      await title.dispose().catch(() => undefined)
+      await delay(280)
+    }
+  }
+  let field: ElementHandle<Element> | null = null
+  const tries = kind === 'description' ? 3 : 2
+  for (let attempt = 0; attempt < tries && !field; attempt += 1) {
+    field = await pickFormField(page, kind)
+    if (!field) await delay(220)
+  }
+  if (!field) return 'no-field'
+  try {
+    await field.evaluate((el) => {
+      const node = el as HTMLElement
+      const w = window as Window & { __cmReveal?: (el: HTMLElement) => boolean }
+      if (typeof w.__cmReveal === 'function') w.__cmReveal(node)
+      else {
+        try {
+          node.scrollIntoView({ block: 'center', inline: 'nearest' })
+        } catch {
+          // ignore
+        }
+      }
+    })
+    await field.evaluate((el, mark) => {
+      ;(el as HTMLElement).setAttribute('data-cm-field', mark)
+    }, kind)
+    await field.click({ delay: 40 }).catch(() => undefined)
+    if (await fieldContainsFocus(field)) return 'ok'
+    await field.evaluate((el) => (el as HTMLElement).focus()).catch(() => undefined)
+    return (await fieldContainsFocus(field)) ? 'ok' : 'no-focus'
+  } finally {
+    await field.dispose().catch(() => undefined)
+  }
+}
+
+async function formFieldHasText(
+  page: Page,
+  kind: 'title' | 'description',
+  value: string
+): Promise<boolean> {
+  const needle = value.replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 48)
+  if (!needle) return false
+  for (const frame of framesOf(page)) {
+    const found = await frame
+      .evaluate((expected, want, descLabels) => {
+        const norm = (value: string | null | undefined): string =>
+          (value || '').replace(/\s+/g, ' ').trim().toLowerCase()
+        const labelOf = (el: HTMLElement): string => {
+          const direct = norm(
+            el.getAttribute('aria-label') ||
+              el.getAttribute('aria-placeholder') ||
+              el.getAttribute('data-placeholder') ||
+              el.getAttribute('placeholder')
+          )
+          if (direct === 'document title') return ''
+          if (direct) return direct
+          const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+          for (const id of ids) {
+            const node = document.getElementById(id)
+            const text = norm(node?.innerText || node?.textContent)
+            if (text) return text
+          }
+          const box = el.closest('[jsname="GYcwYe"], [jsname="NorrI"], .KCm9Q') as HTMLElement | null
+          const hidden = box?.querySelector('[jsname="V67aGc"]') as HTMLElement | null
+          return norm(hidden?.innerText || hidden?.textContent)
+        }
+        const isTitleLabel = (label: string): boolean => {
+          if (!label || label === 'document title') return false
+          if (label.includes('description') || label.includes('mô tả') || label.includes('descri')) {
+            return false
+          }
+          return (
+            label === 'form title' ||
+            label === 'untitled form' ||
+            label.startsWith('form title') ||
+            label.startsWith('untitled form') ||
+            label === 'tiêu đề biểu mẫu' ||
+            label === 'biểu mẫu không có tiêu đề'
+          )
+        }
+        const isDescLabel = (label: string): boolean =>
+          Boolean(label) && descLabels.some((item) => label === item || label.startsWith(item))
+        const nodes = Array.from(
+          document.querySelectorAll(
+            '[data-cm-field], [jsname="GYcwYe"] div[jsname="yrriRe"][role="textbox"], [jsname="NorrI"] div[jsname="yrriRe"][role="textbox"], div[jsname="yrriRe"][role="textbox"], [contenteditable], textarea, [role="textbox"]'
+          )
+        ) as HTMLElement[]
+        for (const el of nodes) {
+          if (norm(el.getAttribute('aria-label')) === 'document title') continue
+          if (el.closest('.wPVTLe, .LIkguc, header#gb')) continue
+          const label = labelOf(el)
+          const marked = el.getAttribute('data-cm-field')
+          const inTitleBox = Boolean(el.closest('[jsname="GYcwYe"]'))
+          const inDescBox = Boolean(el.closest('[jsname="NorrI"]'))
+          const title = marked === 'title' || inTitleBox || isTitleLabel(label)
+          const description = marked === 'description' || inDescBox || isDescLabel(label)
+          if (want === 'title' ? !title || description : !description || title) continue
+          const current = norm(el.innerText || (el as HTMLTextAreaElement).value || '')
+          if (!current || descLabels.includes(current)) continue
+          if (current.includes(expected)) return true
         }
         return false
-      }, text)
+      }, needle, kind, FORM_DESCRIPTION_LABELS)
       .catch(() => false)
-    if (typed) return true
+    if (found) return true
+  }
+  return false
+}
+
+async function readFormFieldText(page: Page, kind: 'title' | 'description'): Promise<string> {
+  for (const frame of framesOf(page)) {
+    const text = await frame
+      .evaluate((want, descLabels) => {
+        const norm = (value: string | null | undefined): string =>
+          (value || '').replace(/\s+/g, ' ').trim().toLowerCase()
+        const labelOf = (el: HTMLElement): string => {
+          const direct = norm(
+            el.getAttribute('aria-label') ||
+              el.getAttribute('aria-placeholder') ||
+              el.getAttribute('data-placeholder') ||
+              el.getAttribute('placeholder')
+          )
+          if (direct === 'document title') return ''
+          if (direct) return direct
+          const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+          for (const id of ids) {
+            const node = document.getElementById(id)
+            const text = norm(node?.innerText || node?.textContent)
+            if (text) return text
+          }
+          const box = el.closest('[jsname="GYcwYe"], [jsname="NorrI"], .KCm9Q') as HTMLElement | null
+          const hidden = box?.querySelector('[jsname="V67aGc"]') as HTMLElement | null
+          return norm(hidden?.innerText || hidden?.textContent)
+        }
+        const isTitleLabel = (label: string): boolean => {
+          if (!label || label === 'document title') return false
+          if (label.includes('description') || label.includes('mô tả') || label.includes('descri')) {
+            return false
+          }
+          return (
+            label === 'form title' ||
+            label === 'untitled form' ||
+            label.startsWith('form title') ||
+            label.startsWith('untitled form') ||
+            label === 'tiêu đề biểu mẫu' ||
+            label === 'biểu mẫu không có tiêu đề'
+          )
+        }
+        const isDescLabel = (label: string): boolean =>
+          Boolean(label) && descLabels.some((item) => label === item || label.startsWith(item))
+        const nodes = Array.from(
+          document.querySelectorAll(
+            '[data-cm-field], [jsname="GYcwYe"] div[jsname="yrriRe"][role="textbox"], [jsname="NorrI"] div[jsname="yrriRe"][role="textbox"], div[jsname="yrriRe"][role="textbox"], [contenteditable], textarea, [role="textbox"]'
+          )
+        ) as HTMLElement[]
+        let best = ''
+        let bestArea = Number.POSITIVE_INFINITY
+        for (const el of nodes) {
+          if (norm(el.getAttribute('aria-label')) === 'document title') continue
+          if (el.closest('.wPVTLe, .LIkguc, header#gb')) continue
+          const label = labelOf(el)
+          const marked = el.getAttribute('data-cm-field')
+          const inTitleBox = Boolean(el.closest('[jsname="GYcwYe"]'))
+          const inDescBox = Boolean(el.closest('[jsname="NorrI"]'))
+          const title = marked === 'title' || inTitleBox || isTitleLabel(label)
+          const description = marked === 'description' || inDescBox || isDescLabel(label)
+          if (want === 'title' ? !title || description : !description || title) continue
+          const current = (el.innerText || (el as HTMLTextAreaElement).value || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+          if (!current) continue
+          const rect = el.getBoundingClientRect()
+          const area = Math.max(rect.width, 1) * Math.max(rect.height, 1)
+          if (area < bestArea) {
+            best = current
+            bestArea = area
+          }
+        }
+        return best
+      }, kind, FORM_DESCRIPTION_LABELS)
+      .catch(() => '')
+    if (text) return text
+  }
+  return ''
+}
+
+async function markedFormField(
+  page: Page,
+  kind: 'title' | 'description'
+): Promise<ElementHandle<Element> | null> {
+  for (const frame of framesOf(page)) {
+    const handle = await frame.$(`[data-cm-field="${kind}"]`).catch(() => null)
+    if (handle) return handle
+  }
+  return null
+}
+
+/**
+ * Gõ vào đúng ô bằng click + Ctrl+A + insertText.
+ * Không gõ nếu focus đang ở ô kia — tránh dán mô tả đè Untitled form.
+ */
+async function typeIntoConfirmedField(
+  page: Page,
+  kind: 'title' | 'description',
+  value: string
+): Promise<'ok' | 'no-field' | 'no-focus' | 'no-text'> {
+  const text = value.trim()
+  if (!text) return 'no-text'
+  const focused = await focusFormEditable(page, kind)
+  if (focused !== 'ok') return focused
+  if ((await focusedFieldKind(page)) !== kind) return 'no-focus'
+
+  const probe = kind === 'description' ? formDescriptionProbe(text) : text
+  const write = async (): Promise<void> => {
+    await pressCtrlKey(page, 'KeyA')
+    await delay(50)
+    if ((await focusedFieldKind(page)) !== kind) {
+      throw new Error('focus lệch')
+    }
+    await insertTextAtFocus(page, text)
   }
 
   try {
-    await page.keyboard.down('Control')
-    await page.keyboard.press('KeyA')
-    await page.keyboard.up('Control')
-    await page.keyboard.type(text, { delay: 4 })
+    await write()
   } catch {
-    // ignore
+    return 'no-focus'
+  }
+  await delay(280)
+
+  const stillPlaceholder =
+    kind === 'title' &&
+    (await readFormFieldText(page, 'title')).toLowerCase().includes('untitled form') &&
+    !text.toLowerCase().includes('untitled form')
+  if (stillPlaceholder || !(await formFieldHasText(page, kind, probe))) {
+    const field = await markedFormField(page, kind)
+    if (!field) return 'no-text'
+    try {
+      if ((await focusedFieldKind(page)) !== kind) {
+        await field.click({ delay: 30 }).catch(() => undefined)
+      }
+      if ((await focusedFieldKind(page)) !== kind) return 'no-focus'
+      await field
+        .evaluate((el, value) => {
+          const node = el as HTMLElement
+          node.focus()
+          const selection = window.getSelection()
+          if (selection) {
+            const range = document.createRange()
+            range.selectNodeContents(node)
+            selection.removeAllRanges()
+            selection.addRange(range)
+          }
+          document.execCommand('insertText', false, value)
+        }, text)
+        .catch(() => undefined)
+      if (!(await formFieldHasText(page, kind, probe))) {
+        await pressCtrlKey(page, 'KeyA')
+        if ((await focusedFieldKind(page)) !== kind) return 'no-focus'
+        await page.keyboard.type(text, { delay: 0 })
+      }
+    } finally {
+      await field.dispose().catch(() => undefined)
+    }
+    await delay(250)
+  }
+  return (await formFieldHasText(page, kind, probe)) ? 'ok' : 'no-text'
+}
+
+async function titleMarkupSample(page: Page): Promise<string> {
+  for (const frame of framesOf(page)) {
+    const sample = await frame
+      .evaluate((selectors: string[]) => {
+        const nodes = Array.from(
+          document.querySelectorAll(['[data-cm-field="title"]', ...selectors].join(','))
+        ) as HTMLElement[]
+        const el = nodes.find((node) => (node.innerText || node.textContent || '').trim())
+        if (!el) return ''
+        return (el.innerHTML || '').replace(/\s+/g, ' ').trim().slice(0, 80)
+      }, FORM_TITLE_SELECTORS)
+      .catch(() => '')
+    if (sample) return sample
+  }
+  return ''
+}
+
+async function titleSelectionIsBold(page: Page): Promise<boolean> {
+  for (const frame of framesOf(page)) {
+    const bolded = await frame
+      .evaluate((selectors: string[]) => {
+        const isBoldWeight = (weight: string): boolean => {
+          const n = Number(weight)
+          return weight === 'bold' || (!Number.isNaN(n) && n >= 600)
+        }
+        const norm = (value: string | null | undefined): string =>
+          (value || '').replace(/\s+/g, ' ').trim().toLowerCase()
+        const labelOf = (el: HTMLElement): string => {
+          const direct = norm(el.getAttribute('aria-label'))
+          if (direct === 'document title') return ''
+          if (direct) return direct
+          const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+          for (const id of ids) {
+            const node = document.getElementById(id)
+            const text = norm(node?.innerText || node?.textContent)
+            if (text) return text
+          }
+          const box = el.closest('[jsname="GYcwYe"], [jsname="NorrI"], .KCm9Q') as HTMLElement | null
+          const hidden = box?.querySelector('[jsname="V67aGc"]') as HTMLElement | null
+          return norm(hidden?.innerText || hidden?.textContent)
+        }
+        const isTitleLabel = (label: string): boolean => {
+          if (!label || label === 'document title') return false
+          if (label.includes('description') || label.includes('mô tả') || label.includes('descri')) {
+            return false
+          }
+          return (
+            label === 'form title' ||
+            label === 'untitled form' ||
+            label.startsWith('form title') ||
+            label.startsWith('untitled form') ||
+            label === 'tiêu đề biểu mẫu' ||
+            label === 'biểu mẫu không có tiêu đề'
+          )
+        }
+        const nodes = Array.from(
+          document.querySelectorAll(['[data-cm-field="title"]', ...selectors].join(','))
+        ) as HTMLElement[]
+        const boldBtn = document.querySelector(
+          '[jsname="GYcwYe"] [jsname="c8csvc"]'
+        ) as HTMLElement | null
+        if (boldBtn?.getAttribute('aria-pressed') === 'true') return true
+        for (const el of nodes) {
+          const marked = el.getAttribute('data-cm-field') === 'title'
+          const inTitleBox = Boolean(el.closest('[jsname="GYcwYe"]'))
+          if (!marked && !inTitleBox && !isTitleLabel(labelOf(el))) continue
+          if (el.closest('[jsname="NorrI"]')) continue
+          if (el.querySelector('b, strong')) return true
+          if (isBoldWeight(window.getComputedStyle(el).fontWeight)) return true
+          const bits = Array.from(el.querySelectorAll('span, font, b, strong')) as HTMLElement[]
+          for (const bit of bits) {
+            if (!(bit.textContent || '').trim()) continue
+            const style = bit.getAttribute('style') || ''
+            if (/font-weight\s*:\s*(bold|[6-9]00)/i.test(style)) return true
+            if (isBoldWeight(window.getComputedStyle(bit).fontWeight)) return true
+          }
+        }
+        return false
+      }, FORM_TITLE_SELECTORS)
+      .catch(() => false)
+    if (bolded) return true
+  }
+  return false
+}
+
+async function execBoldOnFocusedTitle(page: Page): Promise<boolean> {
+  for (const frame of framesOf(page)) {
+    const applied = await frame
+      .evaluate(() => {
+        const active = document.activeElement as HTMLElement | null
+        const target =
+          (active?.closest(
+            '[contenteditable], textarea, [role="textbox"], [jsname="yrriRe"]'
+          ) as HTMLElement | null) || active
+        if (!target) return false
+        const range = document.createRange()
+        range.selectNodeContents(target)
+        const selection = window.getSelection()
+        if (!selection) return false
+        selection.removeAllRanges()
+        selection.addRange(range)
+        return document.execCommand('bold')
+      })
+      .catch(() => false)
+    if (applied) return true
+  }
+  return false
+}
+
+async function clickBoldToolbar(page: Page): Promise<boolean> {
+  const started = Date.now()
+  while (Date.now() - started < 1600) {
+    for (const frame of framesOf(page)) {
+      const clicked = await frame
+        .evaluate((labels: string[]) => {
+          const norm = (value: string | null): string =>
+            (value || '').replace(/\s+/g, ' ').trim().toLowerCase()
+          const enabled = (el: HTMLElement): boolean =>
+            el.getAttribute('aria-disabled') !== 'true' && !el.classList.contains('RDPZE')
+          const preferred = Array.from(
+            document.querySelectorAll(
+              '[jsname="GYcwYe"] [jsname="c8csvc"], [jsname="GYcwYe"] [aria-label="Bold"], [jsname="c8csvc"][aria-label="Bold"]'
+            )
+          ) as HTMLElement[]
+          const nodes = preferred.length
+            ? preferred
+            : (Array.from(document.querySelectorAll('[role="button"], button')) as HTMLElement[])
+          for (const el of nodes) {
+            if (!enabled(el)) continue
+            const label = norm(el.getAttribute('aria-label') || el.getAttribute('data-tooltip'))
+            const hit = labels.some(
+              (item) =>
+                label === item || label.startsWith(`${item} `) || label.startsWith(`${item}(`)
+            )
+            if (!hit && el.getAttribute('jsname') !== 'c8csvc') continue
+            el.click()
+            return true
+          }
+          return false
+        }, BOLD_BUTTON_LABELS)
+        .catch(() => false)
+      if (clicked) return true
+    }
+    await delay(80)
+  }
+  return false
+}
+
+/**
+ * Chọn hết tiêu đề rồi bấm Bold trên toolbar, sau đó Ctrl+B nếu toolbar không đổi DOM.
+ * Chỉ báo thành công khi chữ tiêu đề thực sự nằm trong thẻ đậm.
+ */
+async function boldFormTitleField(page: Page): Promise<boolean> {
+  await page.bringToFront().catch(() => undefined)
+  if ((await focusFormEditable(page, 'title')) !== 'ok') return false
+  if ((await focusedFieldKind(page)) !== 'title') return false
+
+  const selectTitle = async (): Promise<boolean> => {
+    try {
+      await pressCtrlKey(page, 'KeyA')
+    } catch {
+      return false
+    }
+    await delay(80)
+    return (await focusedFieldKind(page)) === 'title'
+  }
+
+  if (!(await selectTitle())) return false
+  if (await titleSelectionIsBold(page)) return true
+
+  try {
+    await pressCtrlKey(page, 'KeyB')
+  } catch {
+    return false
   }
   await delay(200)
-  return page
-    .evaluate((expected) => (document.body?.innerText || '').includes(expected.trim()), text)
-    .catch(() => false)
+  if (await titleSelectionIsBold(page)) return true
+
+  if ((await focusedFieldKind(page)) === 'title') {
+    await execBoldOnFocusedTitle(page)
+    await delay(180)
+    if (await titleSelectionIsBold(page)) return true
+  }
+
+  if ((await focusedFieldKind(page)) !== 'title') {
+    if ((await focusFormEditable(page, 'title')) !== 'ok') return false
+  }
+  if (!(await selectTitle())) return false
+  if (await clickBoldToolbar(page)) {
+    await delay(220)
+    if (await titleSelectionIsBold(page)) return true
+  }
+
+  const field = await markedFormField(page, 'title')
+  if (!field) return false
+  try {
+    await field
+      .evaluate((el) => {
+        const node = el as HTMLElement
+        const text = (node.innerText || '').replace(/\s+/g, ' ').trim()
+        if (!text) return false
+        node.focus()
+        const selection = window.getSelection()
+        if (!selection) return false
+        const range = document.createRange()
+        range.selectNodeContents(node)
+        selection.removeAllRanges()
+        selection.addRange(range)
+        const html = `<b>${text
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')}</b>`
+        document.execCommand('insertHTML', false, html)
+        const after = (node.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase()
+        if (!after.includes(text.toLowerCase().slice(0, 24))) {
+          document.execCommand('selectAll', false)
+          document.execCommand('insertText', false, text)
+        }
+        return true
+      })
+      .catch(() => false)
+  } finally {
+    await field.dispose().catch(() => undefined)
+  }
+  await delay(180)
+  return titleSelectionIsBold(page)
+}
+
+const FORM_DESCRIPTION_LABELS = [
+  'form description',
+  'mô tả biểu mẫu',
+  'descrição do formulário',
+  'descripcion del formulario',
+  'description du formulaire'
+]
+
+function formDescriptionProbe(value: string): string {
+  const line =
+    value
+      .split(/\r?\n/)
+      .map((part) => part.trim())
+      .find((part) => part.length >= 12) || value.trim()
+  return line.slice(0, 48)
+}
+
+async function frameViewportOffset(page: Page, frame: Frame): Promise<{ x: number; y: number }> {
+  if (frame === page.mainFrame()) return { x: 0, y: 0 }
+  try {
+    const owner = await frame.frameElement()
+    const box = owner ? await owner.boundingBox() : null
+    if (!box) return { x: 0, y: 0 }
+    return { x: box.x, y: box.y }
+  } catch {
+    return { x: 0, y: 0 }
+  }
+}
+
+async function focusedFieldKind(page: Page): Promise<'title' | 'description' | 'other'> {
+  for (const frame of framesOf(page)) {
+    const kind = await frame
+      .evaluate((labels: string[]) => {
+        const norm = (value: string | null | undefined): string =>
+          (value || '').replace(/\s+/g, ' ').trim().toLowerCase()
+        const labelOf = (el: HTMLElement): string => {
+          const direct = norm(
+            el.getAttribute('aria-label') ||
+              el.getAttribute('aria-placeholder') ||
+              el.getAttribute('data-placeholder') ||
+              el.getAttribute('placeholder')
+          )
+          if (direct === 'document title') return ''
+          if (direct) return direct
+          const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+          for (const id of ids) {
+            const node = document.getElementById(id)
+            const text = norm(node?.innerText || node?.textContent)
+            if (text) return text
+          }
+          const box = el.closest('[jsname="GYcwYe"], [jsname="NorrI"], .KCm9Q') as HTMLElement | null
+          const hidden = box?.querySelector('[jsname="V67aGc"]') as HTMLElement | null
+          return norm(hidden?.innerText || hidden?.textContent)
+        }
+        const isTitleLabel = (label: string): boolean => {
+          if (!label || label === 'document title') return false
+          if (label.includes('description') || label.includes('mô tả') || label.includes('descri')) {
+            return false
+          }
+          return (
+            label === 'form title' ||
+            label === 'untitled form' ||
+            label.startsWith('form title') ||
+            label.startsWith('untitled form') ||
+            label === 'tiêu đề biểu mẫu' ||
+            label === 'biểu mẫu không có tiêu đề'
+          )
+        }
+        const isDescLabel = (label: string): boolean =>
+          Boolean(label) && labels.some((needle) => label === needle || label.startsWith(needle))
+        let node = document.activeElement as HTMLElement | null
+        for (let depth = 0; depth < 8 && node && node !== document.body; depth += 1) {
+          const marked = node.getAttribute('data-cm-field')
+          if (marked === 'title' || marked === 'description') return marked
+          if (node.closest('[jsname="NorrI"]')) return 'description'
+          if (node.closest('[jsname="GYcwYe"]')) return 'title'
+          const label = labelOf(node)
+          if (isTitleLabel(label)) return 'title'
+          if (isDescLabel(label)) return 'description'
+          node = node.parentElement
+        }
+        return ''
+      }, FORM_DESCRIPTION_LABELS)
+      .catch(() => '')
+    if (kind === 'title' || kind === 'description') return kind
+  }
+  return 'other'
+}
+
+async function insertTextAtFocus(page: Page, text: string): Promise<void> {
+  const client = await page.createCDPSession()
+  try {
+    await client.send('Input.insertText', { text })
+  } finally {
+    await client.detach().catch(() => undefined)
+  }
+}
+
+/**
+ * Ô mô tả không nhận textContent. Chỉ gõ khi focus đúng ô mô tả,
+ * không fallback Ctrl+V khi focus còn ở Untitled form.
+ */
+async function fillFormDescriptionField(page: Page, value: string): Promise<string> {
+  const text = value.trim()
+  if (!text) return 'trống'
+  const result = await typeIntoConfirmedField(page, 'description', text)
+  if (result === 'ok') return ''
+  if (result === 'no-field') return 'không thấy ô mô tả'
+  if (result === 'no-focus') return 'không focus được ô mô tả'
+  return 'chữ không dính vào ô mô tả'
 }
 
 /**
@@ -2476,14 +3182,20 @@ async function fillGoogleFormFields(
   page: Page,
   title: string,
   description: string
-): Promise<{ titleOk: boolean; descOk: boolean }> {
+): Promise<{
+  titleOk: boolean
+  titleBoldOk: boolean
+  descOk: boolean
+  descNote: string
+  titleNote: string
+}> {
   // Chờ editor Form sẵn sàng
   const started = Date.now()
   while (Date.now() - started < 25000) {
     const ready = await page
       .evaluate(() => {
         const nodes = document.querySelectorAll(
-          '[aria-label="Form title"], [aria-label="Untitled form"], [aria-label="Form description"], [aria-label*="tiêu đề" i], [aria-label*="mô tả" i], div[contenteditable="true"]'
+          'div[jsname="yrriRe"][role="textbox"], [aria-label="Form title"], [aria-label="Untitled form"], [aria-label="Form description"], [aria-label*="tiêu đề" i], [aria-label*="mô tả" i], div[contenteditable="true"]'
         )
         return nodes.length > 0
       })
@@ -2492,114 +3204,54 @@ async function fillGoogleFormFields(
     await delay(400)
   }
 
-  let titleOk = await fillFormEditable(
-    page,
-    [
-      '[aria-label="Form title"]',
-      '[aria-label="Untitled form"]',
-      '[aria-label="Tiêu đề biểu mẫu"]',
-      '[aria-label="Biểu mẫu không có tiêu đề"]',
-      'textarea[aria-label="Form title"]',
-      'div[aria-label="Form title"][contenteditable="true"]',
-      'input[aria-label="Form title"]'
-    ],
-    title
-  )
-
-  let descOk = await fillFormDescriptionField(page, description)
-  if (!descOk) {
-    descOk = await fillFormEditable(
-      page,
-      [
-        '[aria-label="Form description"]',
-        '[aria-label="Mô tả biểu mẫu"]',
-        '[aria-label="Description"]',
-        '[aria-label="Mô tả"]',
-        'textarea[aria-label="Form description"]',
-        'div[aria-label="Form description"][contenteditable="true"]',
-        'textarea[placeholder*="Form description" i]',
-        'div[aria-placeholder*="Form description" i]',
-        'div[aria-placeholder*="mô tả" i]'
-      ],
-      description
-    )
+  const titleResult = title ? await typeIntoConfirmedField(page, 'title', title) : 'ok'
+  let titleOk = !title || titleResult === 'ok'
+  let titleNote = titleResult === 'ok' ? '' : titleResult
+  let titleBoldOk = false
+  if (title && titleOk) {
+    titleBoldOk = await boldFormTitleField(page).catch(() => false)
   }
 
-  // Fallback: 2 ô contenteditable đầu trong vùng header Form
-  if ((title && !titleOk) || (description && !descOk)) {
-    const filled = await page
-      .evaluate(
-        (payload: { title: string; description: string; needTitle: boolean; needDesc: boolean }) => {
-          const editables = Array.from(
-            document.querySelectorAll('div[contenteditable="true"], textarea')
-          ) as HTMLElement[]
-          const visible = editables.filter((el) => {
-            const w = window as Window & { __cmReveal?: (el: HTMLElement) => boolean }
-            if (typeof w.__cmReveal === 'function') w.__cmReveal(el)
-            else {
-              try {
-                el.scrollIntoView({ block: 'center', inline: 'nearest' })
-              } catch {
-                // ignore
-              }
-            }
-            const rect = el.getBoundingClientRect()
-            return rect.width > 20 && rect.height > 6
-          })
-          const byLabel = (re: RegExp): HTMLElement | undefined =>
-            editables.find((el) =>
-              re.test(
-                `${el.getAttribute('aria-label') || ''} ${el.getAttribute('aria-placeholder') || ''}`
-              )
-            )
-          const result = { titleOk: !payload.needTitle, descOk: !payload.needDesc }
-
-          const write = (el: HTMLElement, value: string): boolean => {
-            if (!value.trim()) return false
-            el.focus()
-            if ('value' in el) {
-              ;(el as HTMLTextAreaElement).value = value
-            } else {
-              el.textContent = value
-              el.innerText = value
-            }
-            el.dispatchEvent(new InputEvent('input', { bubbles: true, data: value }))
-            el.dispatchEvent(new Event('change', { bubbles: true }))
-            el.dispatchEvent(new Event('blur', { bubbles: true }))
-            const current = (el.textContent || (el as HTMLTextAreaElement).value || '').trim()
-            return current.includes(value.trim())
-          }
-
-          if (payload.needTitle) {
-            const titleEl =
-              byLabel(/form title|untitled form|tiêu đề/i) || visible[0]
-            if (titleEl) result.titleOk = write(titleEl, payload.title)
-          }
-          if (payload.needDesc) {
-            const descEl =
-              byLabel(/form description|mô tả|description/i) ||
-              visible.find((el) => el !== byLabel(/form title|untitled form|tiêu đề/i)) ||
-              visible[1]
-            if (descEl) result.descOk = write(descEl, payload.description)
-          }
-          return result
-        },
-        {
-          title,
-          description,
-          needTitle: Boolean(title.trim()) && !titleOk,
-          needDesc: Boolean(description.trim()) && !descOk
-        }
-      )
-      .catch(() => null)
-
-    if (filled) {
-      if (!titleOk) titleOk = filled.titleOk
-      if (!descOk) descOk = filled.descOk
+  let descNote = description ? await fillFormDescriptionField(page, description) : ''
+  if (title && description && title.trim().toLowerCase() !== description.trim().toLowerCase()) {
+    const titleNow = (await readFormFieldText(page, 'title')).toLowerCase()
+    const probe = formDescriptionProbe(description).toLowerCase()
+    const leaked = Boolean(probe) && titleNow.includes(probe) && !title.toLowerCase().includes(probe)
+    if (leaked) {
+      const restored = await typeIntoConfirmedField(page, 'title', title)
+      titleOk = restored === 'ok'
+      titleNote = restored === 'ok' ? '' : restored
+      titleBoldOk = titleOk ? await boldFormTitleField(page).catch(() => false) : false
+      descNote = await fillFormDescriptionField(page, description)
     }
   }
 
-  return { titleOk, descOk }
+  if (title) {
+    const titleNow = (await readFormFieldText(page, 'title')).toLowerCase()
+    const want = title.trim().toLowerCase().slice(0, 48)
+    if (want && !titleNow.includes(want)) {
+      titleOk = false
+      if (!titleNote) titleNote = 'no-text'
+    }
+  }
+  if (description && title && title.trim().toLowerCase() !== description.trim().toLowerCase()) {
+    const titleNow = (await readFormFieldText(page, 'title')).toLowerCase()
+    const probe = formDescriptionProbe(description).toLowerCase()
+    if (probe && titleNow.includes(probe) && !title.toLowerCase().includes(probe)) {
+      descNote = descNote || 'mô tả dính vào tiêu đề'
+    }
+  }
+  if (description && !descNote) {
+    const descNow = (await readFormFieldText(page, 'description')).toLowerCase()
+    const probe = formDescriptionProbe(description).toLowerCase()
+    if (probe && !descNow.includes(probe)) descNote = 'ô mô tả trống'
+  }
+  if (title && titleOk && !titleBoldOk) {
+    titleBoldOk = await boldFormTitleField(page).catch(() => false)
+  }
+  const descOk = !description || descNote === ''
+
+  return { titleOk, titleBoldOk, descOk, descNote, titleNote }
 }
 
 /**
@@ -3451,9 +4103,12 @@ async function uploadFormHeaderImage(page: Page, imagePath: string): Promise<str
   }
 }
 
-/** Màu theme Form (panel Customize theme → Color, swatch .zY7l6d). */
-const FORM_THEME_COLOR = '#0e79f2'
-/** Cho phép lệch RGB nhỏ vì Google đôi khi ghi #0b7af5 / rgb() thay vì đúng hex. */
+/**
+ * Màu theme Form (Customize theme → Color, swatch .zY7l6d).
+ * Thử theo thứ tự: #065cf5 trước, #0e79f2 nếu palette không có màu ưu tiên.
+ */
+const FORM_THEME_COLORS = ['#065cf5', '#0e79f2'] as const
+/** Cho phép lệch RGB nhỏ vì Google đôi khi ghi hex/rgb gần, không đúng từng số. */
 const FORM_THEME_COLOR_MAX_DIST = 28
 
 async function isFormThemePanelOpen(page: Page): Promise<boolean> {
@@ -3821,7 +4476,7 @@ async function clickFormThemeColorDom(
 }
 
 /**
- * Customize theme → Color: bấm swatch background-color #0e79f2
+ * Customize theme → Color: ưu tiên swatch #065cf5, không có thì #0e79f2
  * (div.UBrD9d > div.zY7l6d).
  */
 async function selectFormThemeColor(page: Page): Promise<string> {
@@ -3839,9 +4494,16 @@ async function selectFormThemeColor(page: Page): Promise<string> {
 
   // Header extract màu mất vài giây; cửa sổ nhỏ phải cuộn mục Color
   let point: ThemeColorPick | null = null
+  let wanted: (typeof FORM_THEME_COLORS)[number] = FORM_THEME_COLORS[0]
   for (let i = 0; i < 8 && !point; i++) {
     await scrollFormThemeColorSection(page)
-    point = await pickFormThemeColorSwatch(page, FORM_THEME_COLOR, FORM_THEME_COLOR_MAX_DIST)
+    for (const hex of FORM_THEME_COLORS) {
+      point = await pickFormThemeColorSwatch(page, hex, FORM_THEME_COLOR_MAX_DIST)
+      if (point) {
+        wanted = hex
+        break
+      }
+    }
     if (point) break
     await delay(450)
   }
@@ -3850,23 +4512,24 @@ async function selectFormThemeColor(page: Page): Promise<string> {
   if (point) {
     const clicked = await mouseClickPoint(page, point)
     if (clicked) {
-      note = `color OK · ${point.matched} · d=${point.dist} · theme:${opened}`
+      note = `color OK · ${point.matched} · want:${wanted} · d=${point.dist} · theme:${opened}`
     }
   }
 
   if (!note) {
-    const domMatched = await clickFormThemeColorDom(
-      page,
-      FORM_THEME_COLOR,
-      FORM_THEME_COLOR_MAX_DIST
-    )
-    if (domMatched) note = `color OK · ${domMatched} · theme:${opened} · dom`
+    for (const hex of FORM_THEME_COLORS) {
+      const domMatched = await clickFormThemeColorDom(page, hex, FORM_THEME_COLOR_MAX_DIST)
+      if (domMatched) {
+        note = `color OK · ${domMatched} · want:${hex} · theme:${opened} · dom`
+        break
+      }
+    }
   }
 
   if (!note) {
     const dump = await dumpFormThemeColors(page)
     note =
-      `color FAIL · không thấy swatch ${FORM_THEME_COLOR}` +
+      `color FAIL · không thấy swatch ${FORM_THEME_COLORS.join(' / ')}` +
       ` · theme:${opened}` +
       (dump ? ` · palette:[${dump}]` : '')
   }
@@ -3883,6 +4546,7 @@ async function openGoogleForm(
     formTitle?: string
     formDescription?: string
     formHeaderPath?: string
+    formLinkEnabled?: boolean
     formLinkStyle?: FormLinkStyle
   }
 ): Promise<PostSetupStepResult & { formUrl?: string }> {
@@ -3898,6 +4562,7 @@ async function openGoogleForm(
     const title = (options?.formTitle ?? '').trim()
     const description = (options?.formDescription ?? '').trim()
     const headerPath = (options?.formHeaderPath ?? '').trim()
+    const linkOn = options?.formLinkEnabled !== false
     const linkStyle: FormLinkStyle = options?.formLinkStyle === 'long' ? 'long' : 'short'
 
     const parts = [`Đã mở Google Form: ${editUrl}`]
@@ -3934,9 +4599,30 @@ async function openGoogleForm(
 
     await runStep('điền', async () => {
       if (fillOn && (title || description)) {
-        const { titleOk, descOk } = await fillGoogleFormFields(page, title, description)
-        if (title) parts.push(titleOk ? `title OK` : `title FAIL`)
-        if (description) parts.push(descOk ? `desc OK` : `desc FAIL`)
+        const { titleOk, titleBoldOk, descOk, descNote, titleNote } = await fillGoogleFormFields(
+          page,
+          title,
+          description
+        )
+        if (title) {
+          const titleFail =
+            titleNote === 'no-field'
+              ? 'không thấy ô'
+              : titleNote === 'no-focus'
+                ? 'không focus được'
+                : 'chữ không dính'
+          let titleLog = titleOk
+            ? titleBoldOk
+              ? 'title OK (đậm)'
+              : 'title OK (chưa đậm)'
+            : `title FAIL (${titleFail})`
+          if (titleOk && !titleBoldOk) {
+            const sample = (await titleMarkupSample(page)).replace(/[·\n\r]/g, ' ')
+            if (sample) titleLog = `title OK (chưa đậm: ${sample})`
+          }
+          parts.push(titleLog)
+        }
+        if (description) parts.push(descOk ? `desc OK` : `desc FAIL · ${descNote}`)
         if ((title && !titleOk) || (description && !descOk)) ok = false
       } else if (fillOn) {
         parts.push('điền Form tắt (thiếu tiêu đề/mô tả)')
@@ -3958,26 +4644,30 @@ async function openGoogleForm(
       if (colorNote.includes('FAIL')) ok = false
     })
 
-    await runStep('publish', async () => {
-      await delay(500)
-      // Form editor hay rebuild iframe khi vừa đổi theme → thử lại 1 lần nếu frame chết
-      let published: { link: string; note: string }
-      try {
-        published = await publishAndGetFormLink(page, editUrl, linkStyle)
-      } catch (error) {
-        if (!isDetachedError(error)) throw error
-        await delay(1500)
-        published = await publishAndGetFormLink(page, editUrl, linkStyle)
-      }
-      parts.push(`link(${linkStyle}): ${published.note} → ${published.link}`)
-      formUrl = published.link
-    })
+    if (linkOn) {
+      await runStep('publish', async () => {
+        await delay(500)
+        // Form editor hay rebuild iframe khi vừa đổi theme → thử lại 1 lần nếu frame chết
+        let published: { link: string; note: string }
+        try {
+          published = await publishAndGetFormLink(page, editUrl, linkStyle)
+        } catch (error) {
+          if (!isDetachedError(error)) throw error
+          await delay(1500)
+          published = await publishAndGetFormLink(page, editUrl, linkStyle)
+        }
+        formUrl = cleanFormUrl(published.link)
+        parts.push(`link(${linkStyle}): ${published.note} → ${formUrl}`)
+      })
 
-    if (!formUrl) {
-      formUrl = formResponderUrlFromEdit(editUrl)
-      if (formUrl) {
-        parts.push(`fallback viewform → ${formUrl}`)
+      if (!formUrl) {
+        formUrl = formResponderUrlFromEdit(editUrl)
+        if (formUrl) {
+          parts.push(`fallback viewform → ${formUrl}`)
+        }
       }
+    } else {
+      parts.push('bỏ qua Publish / lấy đường link Form')
     }
 
     return {
@@ -3987,7 +4677,8 @@ async function openGoogleForm(
       formUrl
     }
   } catch (error) {
-    const fallback = formResponderUrlFromEdit(editUrl)
+    const linkOn = options?.formLinkEnabled !== false
+    const fallback = linkOn ? formResponderUrlFromEdit(editUrl) : undefined
     return {
       step: 'form',
       ok: false,
@@ -3997,24 +4688,29 @@ async function openGoogleForm(
   }
 }
 
-/** Thay [LINK_SHEET] / [LINK_FORM] trong code Apps Script */
+/** Thay [LINK_SHEET] / [LINK_FORM] / [LINK_PDF] trong code Apps Script */
 function injectPlaceholders(
   code: string,
-  options?: { sheetUrl?: string; formUrl?: string }
+  options?: { sheetUrl?: string; formUrl?: string; pdfUrl?: string }
 ): {
   code: string
   sheetReplaced: number
   formReplaced: number
+  pdfReplaced: number
   missingSheet: boolean
   missingForm: boolean
+  missingPdf: boolean
 } {
   let next = code
   const sheetCount = (next.match(/\[LINK_SHEET\]/g) || []).length
   const formCount = (next.match(/\[LINK_FORM\]/g) || []).length
+  const pdfCount = (next.match(/\[LINK_PDF\]/g) || []).length
   let missingSheet = false
   let missingForm = false
+  let missingPdf = false
   let sheetReplaced = 0
   let formReplaced = 0
+  let pdfReplaced = 0
 
   if (sheetCount > 0) {
     if (!options?.sheetUrl?.trim()) {
@@ -4029,12 +4725,29 @@ function injectPlaceholders(
     if (!options?.formUrl?.trim()) {
       missingForm = true
     } else {
-      next = next.split(LINK_FORM_TOKEN).join(options.formUrl.trim())
+      next = next.split(LINK_FORM_TOKEN).join(cleanFormUrl(options.formUrl.trim()))
       formReplaced = formCount
     }
   }
 
-  return { code: next, sheetReplaced, formReplaced, missingSheet, missingForm }
+  if (pdfCount > 0) {
+    if (!options?.pdfUrl?.trim()) {
+      missingPdf = true
+    } else {
+      next = next.split(LINK_PDF_TOKEN).join(options.pdfUrl.trim())
+      pdfReplaced = pdfCount
+    }
+  }
+
+  return {
+    code: next,
+    sheetReplaced,
+    formReplaced,
+    pdfReplaced,
+    missingSheet,
+    missingForm,
+    missingPdf
+  }
 }
 
 /** Tạo tab mới ổn định khi connect CDP (fallback Target.createTarget) */
@@ -5279,6 +5992,26 @@ async function clickV67Label(page: Page, labels: string[]): Promise<boolean> {
   return clickByText(page, labels, 4000)
 }
 
+const APPS_SCRIPT_RERUN_WARNINGS = [
+  'this project requires access to your google account to run',
+  'please try again and allow it this time',
+  'dự án này cần quyền truy cập tài khoản google của bạn',
+  'hãy thử lại và cho phép lần này'
+]
+
+async function hasAppsScriptRerunWarning(page: Page): Promise<boolean> {
+  return pageHasText(page, APPS_SCRIPT_RERUN_WARNINGS)
+}
+
+async function waitForAppsScriptRerunWarning(page: Page, timeoutMs: number): Promise<boolean> {
+  const started = Date.now()
+  while (Date.now() - started < timeoutMs) {
+    if (await hasAppsScriptRerunWarning(page)) return true
+    await delay(350)
+  }
+  return false
+}
+
 async function waitForAuthorizationDialog(page: Page, timeoutMs = 20000): Promise<boolean> {
   const started = Date.now()
   while (Date.now() - started < timeoutMs) {
@@ -5293,9 +6026,38 @@ async function waitForAuthorizationDialog(page: Page, timeoutMs = 20000): Promis
     ) {
       return true
     }
+    if (timeoutMs >= 15000 && (await hasAppsScriptRerunWarning(page))) return false
     await delay(400)
   }
   return false
+}
+
+/**
+ * Execution log: "This project requires access to your Google Account to run.
+ * Please try again and allow it this time." → bấm Run thêm một lần.
+ */
+async function rerunAppsScriptAfterAccountWarning(
+  browser: Browser,
+  page: Page,
+  totpSecret?: string,
+  gmailEmail?: string
+): Promise<string> {
+  await page.bringToFront().catch(() => undefined)
+  const saw =
+    (await hasAppsScriptRerunWarning(page)) ||
+    (await waitForAppsScriptRerunWarning(page, 10000))
+  if (!saw) return ''
+
+  await delay(500)
+  const reran = await runAppsScript(page)
+  if (!reran) return 'Execution log cần Run lại nhưng không bấm được Run'
+
+  await delay(1500)
+  if (await waitForAuthorizationDialog(page, 8000)) {
+    const auth2 = await handleAppsScriptAuthorization(browser, page, totpSecret, gmailEmail)
+    return `Run lại (Execution log: cần allow Google Account) · ${auth2}`
+  }
+  return 'Run lại (Execution log: cần allow Google Account)'
 }
 
 /** Chờ popup OAuth accounts.google.com sau khi bấm Review permissions */
@@ -6665,6 +7427,7 @@ async function pasteAppsScript(
     gmailEmail?: string
     sheetUrl?: string
     formUrl?: string
+    pdfUrl?: string
   }
 ): Promise<PostSetupStepResult> {
   let code = ''
@@ -6687,7 +7450,8 @@ async function pasteAppsScript(
 
   const injected = injectPlaceholders(code, {
     sheetUrl: options.sheetUrl,
-    formUrl: options.formUrl
+    formUrl: options.formUrl,
+    pdfUrl: options.pdfUrl
   })
   if (injected.missingSheet) {
     return {
@@ -6703,6 +7467,7 @@ async function pasteAppsScript(
       detail: `Code có ${LINK_FORM_TOKEN} nhưng chưa lấy được link Form (Publish).`
     }
   }
+  const pdfMissing = injected.missingPdf
   code = injected.code
   const linkNotes: string[] = []
   if (injected.sheetReplaced > 0) {
@@ -6710,6 +7475,11 @@ async function pasteAppsScript(
   }
   if (injected.formReplaced > 0) {
     linkNotes.push(`đã thay ${injected.formReplaced}× ${LINK_FORM_TOKEN} → ${options.formUrl}`)
+  }
+  if (injected.pdfReplaced > 0) {
+    linkNotes.push(`đã thay ${injected.pdfReplaced}× ${LINK_PDF_TOKEN} → ${options.pdfUrl}`)
+  } else if (pdfMissing) {
+    linkNotes.push(`giữ nguyên ${LINK_PDF_TOKEN} (chưa có link Share PDF — vẫn dán script)`)
   }
   const linkNote = linkNotes.length ? ` · ${linkNotes.join(' · ')}` : ''
 
@@ -6838,17 +7608,913 @@ async function pasteAppsScript(
       options.totpSecret,
       options.gmailEmail
     )
+    const rerunDetail = await rerunAppsScriptAfterAccountWarning(
+      browser,
+      page,
+      options.totpSecret,
+      options.gmailEmail
+    )
 
     return {
       step: 'script',
       ok: true,
-      detail: `${pasteDetail} · đã Ctrl+S · đã Run · ${authDetail}`
+      detail: `${pasteDetail} · đã Ctrl+S · đã Run · ${authDetail}${rerunDetail ? ` · ${rerunDetail}` : ''}`
     }
   } catch (error) {
     return {
       step: 'script',
       ok: false,
       detail: error instanceof Error ? error.message : 'Mở/dán Apps Script thất bại'
+    }
+  }
+}
+
+function driveShareUrlFromId(fileId: string): string {
+  return `https://drive.google.com/file/d/${fileId}/view`
+}
+
+function extractDriveFileId(raw: string): string {
+  const match = raw.match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/i)
+  return match?.[1] ?? ''
+}
+
+async function readDriveShareLink(page: Page): Promise<string> {
+  for (const frame of framesOf(page)) {
+    const raw = await frame
+      .evaluate(() => {
+        const chunks: string[] = []
+        document.querySelectorAll('input, textarea, a[href]').forEach((el) => {
+          const input = el as HTMLInputElement
+          if (input.value) chunks.push(input.value)
+          const href = el.getAttribute('href')
+          if (href) chunks.push(href)
+        })
+        chunks.push(document.body?.innerText || '')
+        return chunks.join('\n')
+      })
+      .catch(() => '')
+    const id = extractDriveFileId(raw)
+    if (id) return driveShareUrlFromId(id)
+  }
+  return ''
+}
+
+async function findDriveFileInput(
+  page: Page
+): Promise<ElementHandle<HTMLInputElement> | null> {
+  for (const frame of framesOf(page)) {
+    const handles = await frame.$$('input[type="file"]')
+    for (const handle of handles) {
+      const ok = await handle
+        .evaluate((el) => {
+          const input = el as HTMLInputElement
+          if (input.disabled) return false
+          const accept = (input.getAttribute('accept') || '').toLowerCase()
+          if (accept && !accept.includes('pdf') && !accept.includes('*') && !accept.includes('file')) {
+            return false
+          }
+          return true
+        })
+        .catch(() => false)
+      if (ok) return handle as ElementHandle<HTMLInputElement>
+    }
+  }
+  return null
+}
+
+async function trustedClickElement(el: ElementHandle<Node>): Promise<void> {
+  const target = el as ElementHandle<Element>
+  try {
+    await target.click({ delay: 40 })
+  } catch {
+    const box = await target.boundingBox()
+    const owner = target.frame.page()
+    if (!box || !owner) throw new Error('Không bấm được nút Drive.')
+    await owner.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
+  }
+}
+
+/**
+ * Click thật (isTrusted) — Drive bỏ qua el.click() từ page.evaluate.
+ * kind=new: nút New. kind=upload: mục File upload trong menu đang mở.
+ */
+async function pickDriveControl(
+  page: Page,
+  kind: 'new' | 'upload'
+): Promise<{ el: ElementHandle<Node>; label: string } | null> {
+  for (const frame of framesOf(page)) {
+    const handle = await frame
+      .evaluateHandle((mode) => {
+        const norm = (value: string | null | undefined): string =>
+          (value || '').replace(/\s+/g, ' ').trim()
+        const labelOf = (el: HTMLElement): string =>
+          norm(el.getAttribute('aria-label') || el.getAttribute('data-tooltip') || el.innerText)
+        const leavesDrive = (el: HTMLElement): boolean => {
+          const link = (el.closest('a[href]') as HTMLAnchorElement | null) || null
+          const href = (link?.getAttribute('href') || '').toLowerCase()
+          if (!href || href.startsWith('#') || href.startsWith('javascript:')) return false
+          return !href.includes('drive.google.') && !href.includes('docs.google.')
+        }
+        const inGoogleBar = (el: HTMLElement): boolean =>
+          Boolean(el.closest('#gb, [aria-label="Google apps"], [aria-label="Ứng dụng Google"]'))
+        const visible = (el: HTMLElement): boolean => {
+          const rect = el.getBoundingClientRect()
+          if (rect.width < 8 || rect.height < 8) return false
+          if (rect.width > 520 || rect.height > 96) return false
+          if (rect.bottom < 0 || rect.top > window.innerHeight) return false
+          const style = window.getComputedStyle(el)
+          if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+            return false
+          }
+          if (leavesDrive(el) || inGoogleBar(el)) return false
+          return true
+        }
+        const scoreNew = (label: string): number => {
+          const l = label.toLowerCase()
+          if (!l || l.length > 40) return 0
+          if (/folder|thư mục|shared|chia sẻ/.test(l)) return 0
+          if (l === 'new' || l === 'mới' || l === '새로 만들기' || l === '신규' || l === '新規') return 30
+          if (l.startsWith('new ') || l.startsWith('mới ')) return 8
+          return 0
+        }
+        const scoreUpload = (label: string): number => {
+          const l = label.toLowerCase()
+          if (!l || l.length > 80) return 0
+          const folder =
+            /folder|thư mục|thu muc|폴더|フォルダ|文件夹|資料夾|ordner|dossier|carpeta|โฟลเดอร์/.test(l)
+          const upload =
+            /upload|tải|tai tep|업로드|アップロード|上传|上傳|hochladen|importer|téléverser|televerser|subir|อัปโหลด/.test(
+              l
+            )
+          const file = /file|tệp|tep|파일|ファイル|文件|檔案|datei|fichier|archivo|ไฟล์/.test(l)
+          if (folder) return 0
+          if (
+            l === 'file upload' ||
+            l === 'upload file' ||
+            l === 'upload files' ||
+            l === 'tải tệp lên' ||
+            l === '파일 업로드'
+          ) {
+            return 40
+          }
+          if (upload && file) return 28
+          return 0
+        }
+
+        if (mode === 'new') {
+          const guided = document.querySelector('[guidedhelpid="new_menu_button"]') as HTMLElement | null
+          if (guided) {
+            const inner = (
+              guided.matches('button, [role="button"]')
+                ? guided
+                : (guided.querySelector('button, [role="button"]') as HTMLElement | null)
+            ) || guided
+            if (visible(inner)) return inner
+          }
+        }
+
+        const selector =
+          mode === 'new'
+            ? 'button, [role="button"]'
+            : '[role="menuitem"], [role="menuitemradio"], [role="option"], .goog-menuitem'
+        const nodes = Array.from(document.querySelectorAll(selector)) as HTMLElement[]
+        const scored = nodes
+          .map((el) => {
+            const label = labelOf(el)
+            if (!visible(el)) return null
+            const score = mode === 'new' ? scoreNew(label) : scoreUpload(label)
+            if (!score) return null
+            const target =
+              mode === 'upload'
+                ? ((el.closest('[role="menuitem"]') as HTMLElement | null) || el)
+                : el
+            return { el: target, score, label }
+          })
+          .filter(Boolean) as Array<{ el: HTMLElement; score: number; label: string }>
+        scored.sort((a, b) => b.score - a.score || a.label.length - b.label.length)
+        return scored[0]?.el ?? null
+      }, kind)
+      .catch(() => null)
+    if (!handle) continue
+    const el = handle.asElement()
+    if (!el) {
+      await handle.dispose().catch(() => undefined)
+      continue
+    }
+    const label = await el
+      .evaluate((node) => {
+        const item = node as HTMLElement
+        return (
+          item.getAttribute('aria-label') ||
+          item.getAttribute('data-tooltip') ||
+          item.innerText ||
+          ''
+        )
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 80)
+      })
+      .catch(() => '')
+    return { el, label }
+  }
+  return null
+}
+
+async function listDriveMenuLabels(page: Page): Promise<string[]> {
+  const labels: string[] = []
+  for (const frame of framesOf(page)) {
+    const part = await frame
+      .evaluate(() =>
+        Array.from(document.querySelectorAll('[role="menuitem"], [role="menu"] [role="option"]'))
+          .map((el) =>
+            (el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim()
+          )
+          .filter((text) => text.length > 0 && text.length < 80)
+          .slice(0, 8)
+      )
+      .catch(() => [] as string[])
+    labels.push(...part)
+  }
+  return [...new Set(labels)].slice(0, 8)
+}
+
+async function waitForDriveMenu(page: Page, timeoutMs: number): Promise<boolean> {
+  const started = Date.now()
+  while (Date.now() - started < timeoutMs) {
+    const count = await page
+      .evaluate(
+        () =>
+          document.querySelectorAll('[role="menu"] [role="menuitem"], [role="menuitem"]').length
+      )
+      .catch(() => 0)
+    if (count > 0) return true
+    await delay(200)
+  }
+  return false
+}
+
+async function uploadFileToDrivePage(page: Page, absPath: string): Promise<string> {
+  await enableSilentFileChooser(page)
+  await page
+    .waitForSelector('[guidedhelpid="new_menu_button"]', { timeout: 15000 })
+    .catch(() => undefined)
+
+  let lastNote = ''
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await stayOnMyDrive(page)
+    const newer = await pickDriveControl(page, 'new')
+    const newLabel = newer?.label || ''
+    if (newer) {
+      await trustedClickElement(newer.el)
+      await newer.el.dispose().catch(() => undefined)
+    }
+    const menuReady = await waitForDriveMenu(page, 4000)
+    const upload = await pickDriveControl(page, 'upload')
+    if (!upload) {
+      const labels = await listDriveMenuLabels(page)
+      lastNote = `New(${newLabel || 'fail'}) · menu ${menuReady ? labels.join(' | ') || 'trống' : 'không mở'}`
+      await page.keyboard.press('Escape').catch(() => undefined)
+      await delay(400)
+      continue
+    }
+
+    const nested = await upload.el.$('input[type="file"]')
+    if (nested) {
+      await assignFileToInput(nested as ElementHandle<HTMLInputElement>, absPath)
+      const note = `input-menu · New(${newLabel || 'fail'}) · Upload(${upload.label || 'ok'})`
+      await upload.el.dispose().catch(() => undefined)
+      return note
+    }
+
+    const chooserPromise = page.waitForFileChooser({ timeout: 8000 }).catch(() => null)
+    await trustedClickElement(upload.el)
+    const chooser = await chooserPromise
+    if (chooser) {
+      await chooser.accept([absPath])
+      const note = `chooser · New(${newLabel || 'fail'}) · Upload(${upload.label || 'ok'})`
+      await upload.el.dispose().catch(() => undefined)
+      return note
+    }
+
+    await delay(600)
+    const input = await findDriveFileInput(page)
+    if (input) {
+      await assignFileToInput(input, absPath)
+      const note = `input · New(${newLabel || 'fail'}) · Upload(${upload.label || 'ok'})`
+      await upload.el.dispose().catch(() => undefined)
+      return note
+    }
+
+    lastNote = `New(${newLabel || 'fail'}) · Upload(${upload.label || 'fail'}) · không có hộp chọn file`
+    await upload.el.dispose().catch(() => undefined)
+    await page.keyboard.press('Escape').catch(() => undefined)
+    await delay(400)
+  }
+
+  throw new Error(
+    `Không mở được hộp chọn file trên Drive${lastNote ? ` (${lastNote})` : ''}.`
+  )
+}
+
+async function waitForDriveFileId(page: Page, fileName: string, timeoutMs: number): Promise<string> {
+  const started = Date.now()
+  const lower = fileName.toLowerCase()
+  const stem = lower.replace(/\.pdf$/i, '').replace(/\.pdf$/i, '')
+  let refreshed = false
+  while (Date.now() - started < timeoutMs) {
+    for (const frame of framesOf(page)) {
+      const id = await frame
+        .evaluate(
+          (name, stemName) => {
+            const nodes = Array.from(
+              document.querySelectorAll('[data-id], [aria-label], [data-tooltip], a[href*="/file/d/"]')
+            ) as HTMLElement[]
+            for (const el of nodes) {
+              const label = (
+                el.getAttribute('aria-label') ||
+                el.getAttribute('data-tooltip') ||
+                el.innerText ||
+                ''
+              )
+                .replace(/\s+/g, ' ')
+                .trim()
+                .toLowerCase()
+              if (!label && !el.getAttribute('href')) continue
+              const href = el.getAttribute('href') || ''
+              const hrefId = href.match(/\/file\/d\/([a-zA-Z0-9_-]+)/)?.[1] || ''
+              const exact =
+                Boolean(label) &&
+                (label === name || label.startsWith(`${name} `) || label.startsWith(`${name}.`))
+              const renamed =
+                Boolean(stemName) &&
+                Boolean(label) &&
+                (label === stemName || label.startsWith(`${stemName} `))
+              if (!exact && !renamed) continue
+              const row = (el.closest('[data-id]') as HTMLElement | null) || el
+              const fileId = row.getAttribute('data-id') || hrefId || ''
+              if (!fileId || fileId.length < 10) continue
+              return fileId
+            }
+            return ''
+          },
+          lower,
+          stem
+        )
+        .catch(() => '')
+      if (id) return id
+    }
+    // Một lần giữa chừng: reload list nếu chưa thấy file
+    if (!refreshed && Date.now() - started > 20000) {
+      refreshed = true
+      await page.goto(DRIVE_MY_DRIVE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => undefined)
+      await delay(1500)
+      continue
+    }
+    await delay(1000)
+  }
+  return ''
+}
+
+async function clickDriveFile(page: Page, fileName: string): Promise<boolean> {
+  const lower = fileName.toLowerCase()
+  const stem = lower.replace(/\.pdf$/i, '').replace(/\.pdf$/i, '')
+  for (const frame of framesOf(page)) {
+    const handle = await frame
+      .evaluateHandle((name, stemName) => {
+        const nodes = Array.from(
+          document.querySelectorAll('[aria-label], [data-tooltip], [data-id]')
+        ) as HTMLElement[]
+        const matches = nodes.filter((node) => {
+          const label = (
+            node.getAttribute('aria-label') ||
+            node.getAttribute('data-tooltip') ||
+            node.innerText ||
+            ''
+          )
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase()
+          if (!label || label.length > 160) return false
+          const rect = node.getBoundingClientRect()
+          if (rect.width < 8 || rect.height < 8) return false
+          return (
+            label === name ||
+            label.startsWith(`${name} `) ||
+            (stemName && (label === stemName || label.startsWith(`${stemName} `)))
+          )
+        })
+        matches.sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)
+        return matches[0] ?? null
+      }, lower, stem)
+      .catch(() => null)
+    if (!handle) continue
+    const el = handle.asElement()
+    if (!el) {
+      await handle.dispose().catch(() => undefined)
+      continue
+    }
+    await trustedClickElement(el).catch(() => undefined)
+    await handle.dispose().catch(() => undefined)
+    return true
+  }
+  return false
+}
+
+async function trustedClickNeedles(page: Page, needles: string[], avoid: string[]): Promise<boolean> {
+  const need = needles.map((item) => item.toLowerCase())
+  const block = avoid.map((item) => item.toLowerCase())
+  for (const frame of framesOf(page)) {
+    const handle = await frame
+      .evaluateHandle((needlesIn, blocked) => {
+        const nodes = Array.from(
+          document.querySelectorAll('button, [role="button"], [role="menuitem"]')
+        ) as HTMLElement[]
+        const scored = nodes
+          .map((el) => {
+            const label = (
+              el.getAttribute('aria-label') ||
+              el.getAttribute('data-tooltip') ||
+              el.innerText ||
+              ''
+            )
+              .replace(/\s+/g, ' ')
+              .trim()
+              .toLowerCase()
+            if (!label || label.length > 80) return null
+            if (blocked.some((item) => label.includes(item))) return null
+            if (!needlesIn.some((item) => label.includes(item))) return null
+            const rect = el.getBoundingClientRect()
+            if (rect.width < 8 || rect.height < 8) return null
+            return { el, label }
+          })
+          .filter(Boolean) as Array<{ el: HTMLElement; label: string }>
+        scored.sort((a, b) => a.label.length - b.label.length)
+        return scored[0]?.el ?? null
+      }, need, block)
+      .catch(() => null)
+    if (!handle) continue
+    const el = handle.asElement()
+    if (!el) {
+      await handle.dispose().catch(() => undefined)
+      continue
+    }
+    try {
+      await trustedClickElement(el)
+    } catch {
+      await handle.dispose().catch(() => undefined)
+      continue
+    }
+    await handle.dispose().catch(() => undefined)
+    return true
+  }
+  return false
+}
+
+async function driveShareDialogReady(page: Page): Promise<boolean> {
+  for (const frame of framesOf(page)) {
+    const ready = await frame
+      .evaluate(() => {
+        const nodes = Array.from(
+          document.querySelectorAll('[role="dialog"], [aria-modal="true"]')
+        ) as HTMLElement[]
+        return nodes.some((el) => {
+          const text = (el.innerText || '').replace(/\s+/g, ' ').toLowerCase()
+          return (
+            text.includes('general access') ||
+            text.includes('quyền truy cập chung') ||
+            text.includes('restricted') ||
+            text.includes('bị hạn chế')
+          )
+        })
+      })
+      .catch(() => false)
+    if (ready) return true
+  }
+  return false
+}
+
+async function waitForDriveShareDialog(page: Page, timeoutMs = 8000): Promise<boolean> {
+  const started = Date.now()
+  while (Date.now() - started < timeoutMs) {
+    if (await driveShareDialogReady(page)) return true
+    await delay(300)
+  }
+  return false
+}
+
+/** Nút quyền hiện tại trong hộp Share đã là Anyone with the link. */
+async function driveAccessShowsAnyone(page: Page): Promise<boolean> {
+  for (const frame of framesOf(page)) {
+    const shown = await frame
+      .evaluate(() => {
+        const norm = (value: string): string => value.replace(/\s+/g, ' ').trim().toLowerCase()
+        const dialogs = Array.from(
+          document.querySelectorAll('[role="dialog"], [aria-modal="true"]')
+        ) as HTMLElement[]
+        const buttons = dialogs.flatMap((dialog) =>
+          Array.from(dialog.querySelectorAll('button, [role="button"], [role="combobox"]'))
+        ) as HTMLElement[]
+        return buttons.some((el) => {
+          if (el.closest('[role="menu"], [role="listbox"], [role="menuitem"], [role="option"]')) {
+            return false
+          }
+          const label = norm(el.getAttribute('aria-label') || el.innerText || '')
+          if (label.includes('restricted') || label.includes('bị hạn chế')) return false
+          return (
+            label.startsWith('anyone with the link') ||
+            label.startsWith('bất kỳ ai có đường liên kết')
+          )
+        })
+      })
+      .catch(() => false)
+    if (shown) return true
+  }
+  return false
+}
+
+async function clickDriveAccessChoice(
+  page: Page,
+  mode: 'restricted' | 'anyone'
+): Promise<boolean> {
+  for (const frame of framesOf(page)) {
+    const handle = await frame
+      .evaluateHandle((choice) => {
+        const norm = (value: string): string => value.replace(/\s+/g, ' ').trim().toLowerCase()
+        const labelOf = (el: HTMLElement): string =>
+          norm(el.getAttribute('aria-label') || el.innerText || '')
+        const visible = (el: HTMLElement): boolean => {
+          const rect = el.getBoundingClientRect()
+          if (rect.width < 8 || rect.height < 8 || rect.width > 680 || rect.height > 150) return false
+          if (rect.bottom < 0 || rect.top > window.innerHeight) return false
+          const style = window.getComputedStyle(el)
+          return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0
+        }
+        const matches = (label: string): boolean => {
+          if (!label || label.length > 160) return false
+          if (choice === 'restricted') {
+            if (label.includes('anyone') || label.includes('bất kỳ ai')) return false
+            return label === 'restricted' || label.startsWith('restricted') || label.startsWith('bị hạn chế')
+          }
+          return (
+            label === 'anyone with the link' ||
+            label.startsWith('anyone with the link') ||
+            label.startsWith('bất kỳ ai có đường liên kết')
+          )
+        }
+        const dialogs = Array.from(
+          document.querySelectorAll('[role="dialog"], [aria-modal="true"]')
+        ) as HTMLElement[]
+        const menus = Array.from(
+          document.querySelectorAll('[role="menu"], [role="listbox"]')
+        ) as HTMLElement[]
+        const roots = choice === 'restricted' ? dialogs : [...menus, ...dialogs]
+        const selector =
+          choice === 'restricted'
+            ? 'button, [role="button"], [role="combobox"], [aria-haspopup], span, div'
+            : '[role="menuitem"], [role="option"], [role="menuitemradio"], button, [role="button"], span, div'
+        const hits: HTMLElement[] = []
+        for (const root of roots) {
+          for (const node of Array.from(root.querySelectorAll(selector)) as HTMLElement[]) {
+            if (!visible(node) || !matches(labelOf(node))) continue
+            hits.push(node)
+          }
+        }
+        hits.sort((a, b) => {
+          const ra = a.getBoundingClientRect()
+          const rb = b.getBoundingClientRect()
+          return ra.width * ra.height - rb.width * rb.height
+        })
+        const el = hits[0]
+        if (!el) return null
+        const host = el.closest(
+          'button, [role="button"], [role="combobox"], [role="menuitem"], [role="option"], [aria-haspopup]'
+        ) as HTMLElement | null
+        if (!host) return el
+        const hostRect = host.getBoundingClientRect()
+        if (hostRect.width > 680 || hostRect.height > 160) return el
+        return host
+      }, mode)
+      .catch(() => null)
+    if (!handle) continue
+    const el = handle.asElement()
+    if (!el) {
+      await handle.dispose().catch(() => undefined)
+      continue
+    }
+    try {
+      await trustedClickElement(el)
+    } catch {
+      await handle.dispose().catch(() => undefined)
+      continue
+    }
+    await handle.dispose().catch(() => undefined)
+    return true
+  }
+  return false
+}
+
+/** General access: Restricted → Anyone with the link. */
+async function setDriveLinkToAnyone(page: Page): Promise<boolean> {
+  await waitForDriveShareDialog(page, 8000)
+  if (await driveAccessShowsAnyone(page)) return true
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (await clickDriveAccessChoice(page, 'anyone')) {
+      await delay(700)
+      if (await driveAccessShowsAnyone(page)) return true
+    }
+    await clickDriveAccessChoice(page, 'restricted')
+    await delay(700)
+    if (await clickDriveAccessChoice(page, 'anyone')) {
+      await delay(800)
+      if (await driveAccessShowsAnyone(page)) return true
+    }
+  }
+  return false
+}
+
+/** File đang chọn: Ctrl+Alt+A mở thẳng hộp Share (mục Share trong menu con). */
+async function pressDriveShareShortcut(page: Page): Promise<void> {
+  await page.bringToFront().catch(() => undefined)
+  await page.keyboard.down('Control')
+  await page.keyboard.down('Alt')
+  await page.keyboard.press('KeyA')
+  await page.keyboard.up('Alt')
+  await page.keyboard.up('Control')
+}
+
+/**
+ * kind=opener: nút/mục Share có mũi tên menu con.
+ * kind=leaf: mục Share bên trong menu (không có menu con).
+ */
+async function clickDriveShareItem(page: Page, kind: 'opener' | 'leaf'): Promise<boolean> {
+  for (const frame of framesOf(page)) {
+    const handle = await frame
+      .evaluateHandle((mode) => {
+        const norm = (value: string | null | undefined): string =>
+          (value || '').replace(/\s+/g, ' ').trim().toLowerCase()
+        const labelOf = (el: HTMLElement): string =>
+          norm(el.getAttribute('aria-label') || el.getAttribute('data-tooltip') || el.innerText)
+        const visible = (el: HTMLElement): boolean => {
+          const rect = el.getBoundingClientRect()
+          if (rect.width < 8 || rect.height < 8 || rect.width > 420 || rect.height > 80) return false
+          if (rect.bottom < 0 || rect.top > window.innerHeight) return false
+          const style = window.getComputedStyle(el)
+          return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0
+        }
+        const isShare = (label: string): boolean => {
+          if (!label || label.length > 40) return false
+          if (
+            label.includes('shared with me') ||
+            label.includes('được chia sẻ với tôi') ||
+            label.includes('share a copy') ||
+            label.includes('chia sẻ bản sao')
+          ) {
+            return false
+          }
+          return label === 'share' || label === 'chia sẻ' || label.startsWith('share ') || label.startsWith('chia sẻ ')
+        }
+        const nodes = Array.from(
+          document.querySelectorAll('button, [role="button"], [role="menuitem"]')
+        ) as HTMLElement[]
+        const hits = nodes.filter((el) => {
+          if (!visible(el) || !isShare(labelOf(el))) return false
+          const inMenu = Boolean(el.closest('[role="menu"]'))
+          const popup = (el.getAttribute('aria-haspopup') || '').toLowerCase()
+          const opensMenu = popup === 'true' || popup === 'menu'
+          if (mode === 'leaf') return inMenu && !opensMenu
+          return !inMenu || opensMenu
+        })
+        hits.sort((a, b) => {
+          const ra = a.getBoundingClientRect()
+          const rb = b.getBoundingClientRect()
+          return ra.width * ra.height - rb.width * rb.height
+        })
+        return hits[0] ?? null
+      }, kind)
+      .catch(() => null)
+    if (!handle) continue
+    const el = handle.asElement()
+    if (!el) {
+      await handle.dispose().catch(() => undefined)
+      continue
+    }
+    try {
+      await trustedClickElement(el)
+    } catch {
+      await handle.dispose().catch(() => undefined)
+      continue
+    }
+    await handle.dispose().catch(() => undefined)
+    return true
+  }
+  return false
+}
+
+async function openDriveShareDialog(page: Page, fileName: string): Promise<boolean> {
+  await page.bringToFront().catch(() => undefined)
+  await pressDriveShareShortcut(page)
+  if (await waitForDriveShareDialog(page, 2500)) return true
+
+  // Share (mở menu con) → Share nữa, rồi mới tới Anyone with the link
+  if (await clickDriveShareItem(page, 'opener')) {
+    await delay(450)
+    if (await driveShareDialogReady(page)) return true
+    if (await clickDriveShareItem(page, 'leaf')) {
+      if (await waitForDriveShareDialog(page, 4000)) return true
+    }
+  }
+
+  const point = await page
+    .evaluate((name) => {
+      const stem = name.replace(/\.pdf$/i, '')
+      const nodes = Array.from(
+        document.querySelectorAll('[aria-label], [data-tooltip], [data-id]')
+      ) as HTMLElement[]
+      const el = nodes.find((node) => {
+        const label = (
+          node.getAttribute('aria-label') ||
+          node.getAttribute('data-tooltip') ||
+          node.innerText ||
+          ''
+        )
+          .replace(/\s+/g, ' ')
+          .trim()
+          .toLowerCase()
+        return (
+          label === name ||
+          label.startsWith(`${name} `) ||
+          (stem && (label === stem || label.startsWith(`${stem} `)))
+        )
+      })
+      if (!el) return null
+      const rect = el.getBoundingClientRect()
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+    }, fileName.toLowerCase())
+    .catch(() => null)
+  if (point) {
+    await page.mouse.click(point.x, point.y, { button: 'right' })
+    await delay(450)
+    if (await clickDriveShareItem(page, 'opener')) {
+      await delay(350)
+      if (!(await driveShareDialogReady(page))) await clickDriveShareItem(page, 'leaf')
+      if (await waitForDriveShareDialog(page, 4000)) return true
+    }
+  }
+
+  await pressDriveShareShortcut(page)
+  return waitForDriveShareDialog(page, 2500)
+}
+
+/** Đóng tab Google Books / app khác tự mở trong lúc đang ở Drive. */
+function closeStrayGoogleTabs(browser: Browser, keep: Page): () => void {
+  const onTarget = (target: Target): void => {
+    if (target.type() !== 'page') return
+    void (async () => {
+      try {
+        const opened = await target.page()
+        if (!opened || opened === keep || opened.isClosed()) return
+        await delay(200)
+        if (opened.isClosed() || opened === keep) return
+        const url = opened.url().toLowerCase()
+        if (url.includes('books.google.') || url.includes('play.google.com/books')) {
+          await opened.close().catch(() => undefined)
+        }
+      } catch {
+        // ignore
+      }
+    })()
+  }
+  browser.on('targetcreated', onTarget)
+  return () => {
+    browser.off('targetcreated', onTarget)
+  }
+}
+
+async function stayOnMyDrive(page: Page): Promise<void> {
+  if (!page.url().toLowerCase().includes('books.google.')) return
+  await page.goto(DRIVE_MY_DRIVE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => undefined)
+  await delay(1000)
+}
+
+/**
+ * My Drive → File upload PDF → Share → Anyone with the link → lấy URL.
+ */
+async function uploadDrivePdf(
+  browser: Browser,
+  pdfPath: string
+): Promise<PostSetupStepResult & { pdfUrl?: string }> {
+  const absPath = pdfPath ? (isAbsolute(pdfPath) ? pdfPath : resolve(pdfPath)) : ''
+  if (!absPath || !existsSync(absPath)) {
+    return { step: 'drive', ok: false, detail: 'Chưa chọn file PDF, hoặc không thấy file.' }
+  }
+  if (!absPath.toLowerCase().endsWith('.pdf')) {
+    return { step: 'drive', ok: false, detail: 'File upload Drive phải là PDF (.pdf).' }
+  }
+
+  const fileName = basename(absPath)
+  try {
+    const page = await openUrlInNewTab(browser, DRIVE_MY_DRIVE_URL)
+    await page.bringToFront().catch(() => undefined)
+    await delay(1800)
+    const stopStrayTabs = closeStrayGoogleTabs(browser, page)
+    try {
+    await clickByText(
+      page,
+      ['got it', 'đã hiểu', 'dismiss', 'not now', 'no thanks', 'để sau'],
+      2500,
+      ['cancel', 'hủy', 'books', 'google books']
+    ).catch(() => false)
+    await stayOnMyDrive(page)
+
+    // Chờ toolbar Drive sẵn sàng
+    await page
+      .waitForFunction(
+        () => {
+          const t = (document.body?.innerText || '').toLowerCase()
+          return t.includes('my drive') || t.includes('drive của tôi') || t.includes('new') || t.includes('mới')
+        },
+        { timeout: 20000 }
+      )
+      .catch(() => undefined)
+
+    let uploadNote = ''
+    try {
+      uploadNote = await uploadFileToDrivePage(page, absPath)
+    } catch (error) {
+      return {
+        step: 'drive',
+        ok: false,
+        detail: error instanceof Error ? error.message : 'Không upload được PDF lên Drive'
+      }
+    }
+
+    // Chờ thanh upload / toast
+    await delay(2500)
+    await page
+      .waitForFunction(
+        () => {
+          const t = (document.body?.innerText || '').toLowerCase()
+          return (
+            t.includes('upload complete') ||
+            t.includes('hoàn tất') ||
+            t.includes('1 upload') ||
+            t.includes('uploaded') ||
+            t.includes('đã tải')
+          )
+        },
+        { timeout: 90000 }
+      )
+      .catch(() => undefined)
+
+    const fileId = await waitForDriveFileId(page, fileName, 90000)
+    if (!fileId) {
+      return {
+        step: 'drive',
+        ok: false,
+        detail: `Đã gửi file (${uploadNote}) nhưng chưa thấy ${fileName} trong My Drive.`
+      }
+    }
+
+    await clickDriveFile(page, fileName)
+    await delay(700)
+    const shared = await openDriveShareDialog(page, fileName)
+    const anyone = shared ? await setDriveLinkToAnyone(page) : false
+
+    let pdfUrl = await readDriveShareLink(page)
+    if (!pdfUrl && fileId) pdfUrl = driveShareUrlFromId(fileId)
+    if (shared) {
+      await clickByText(page, ['copy link', 'sao chép đường liên kết', 'copy'], 2500).catch(() => false)
+      await clickByText(page, ['done', 'xong', 'close', 'đóng'], 2000, ['cancel', 'hủy']).catch(
+        () => false
+      )
+    }
+
+    if (!pdfUrl) {
+      return {
+        step: 'drive',
+        ok: false,
+        detail: `Đã upload ${fileName} (${uploadNote}) nhưng không lấy được link Share.`
+      }
+    }
+    const accessNote = !shared
+      ? ' · không bấm được Share'
+      : anyone
+        ? ''
+        : ' · chưa đổi Anyone with the link'
+    return {
+      step: 'drive',
+      ok: true,
+      detail: `Upload ${fileName} (${uploadNote}) · ${pdfUrl}${accessNote}`,
+      pdfUrl
+    }
+    } finally {
+      stopStrayTabs()
+    }
+  } catch (error) {
+    return {
+      step: 'drive',
+      ok: false,
+      detail: error instanceof Error ? error.message : 'Upload PDF lên Drive thất bại'
     }
   }
 }
@@ -6869,7 +8535,11 @@ export async function runPostLoginSetup(
     | 'formTitle'
     | 'formDescription'
     | 'formHeaderPath'
+    | 'formLinkEnabled'
     | 'formLinkStyle'
+    | 'drivePdfEnabled'
+    | 'drivePdfLane'
+    | 'drivePdfPath'
   > & { gmailEmail?: string },
   onStep?: (step: PostSetupStepResult) => void
 ): Promise<PostSetupStepResult[]> {
@@ -6896,19 +8566,49 @@ export async function runPostLoginSetup(
       : avatarResult.detail
   })
 
-  const formResult = await openGoogleForm(browser, {
-    formFillEnabled: options.formFillEnabled,
-    formTitle: options.formTitle,
-    formDescription: options.formDescription,
-    formHeaderPath: options.formHeaderPath,
-    formLinkStyle: options.formLinkStyle
-  })
-  push({
-    step: formResult.step,
-    ok: formResult.ok,
-    detail: formResult.detail,
-    formUrl: formResult.formUrl
-  })
+  const wantForm =
+    Boolean(options.formFillEnabled) || Boolean(options.formLinkEnabled)
+  let formUrl: string | undefined
+  if (wantForm) {
+    const formResult = await openGoogleForm(browser, {
+      formFillEnabled: options.formFillEnabled,
+      formTitle: options.formTitle,
+      formDescription: options.formDescription,
+      formHeaderPath: options.formHeaderPath,
+      formLinkEnabled: options.formLinkEnabled,
+      formLinkStyle: options.formLinkStyle
+    })
+    formUrl = formResult.formUrl
+    push({
+      step: formResult.step,
+      ok: formResult.ok,
+      detail: formResult.detail,
+      formUrl: formResult.formUrl
+    })
+  } else {
+    push({
+      step: 'form',
+      ok: true,
+      detail: 'Bỏ qua Google Form (đã tắt điền Form và lấy đường link Form)'
+    })
+  }
+
+  let pdfUrl: string | undefined
+  if (options.drivePdfEnabled) {
+    const picked = resolveDrivePdfForLane(options.drivePdfLane ?? 0)
+    if ('error' in picked) {
+      push({ step: 'drive', ok: false, detail: picked.error })
+    } else {
+      const pdfResult = await uploadDrivePdf(browser, picked.path)
+      pdfUrl = pdfResult.pdfUrl
+      push({
+        step: pdfResult.step,
+        ok: pdfResult.ok,
+        detail: `${picked.folder}/${picked.fileName} · ${pdfResult.detail}`,
+        pdfUrl: pdfResult.pdfUrl
+      })
+    }
+  }
 
   const sheetResult = await openSpreadsheet(browser)
   push({
@@ -6925,7 +8625,8 @@ export async function runPostLoginSetup(
       totpSecret: options.totpSecret,
       gmailEmail: options.gmailEmail,
       sheetUrl: sheetResult.sheetUrl,
-      formUrl: formResult.formUrl
+      formUrl,
+      pdfUrl
     })
   )
 

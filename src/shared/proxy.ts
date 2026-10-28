@@ -92,6 +92,11 @@ function splitHostPort(value: string): { host: string; port: number } | null {
   return { host, port }
 }
 
+/** Đã gắn proxy thật: loại khác none và có host. */
+export function hasProxy(proxy: ProxyConfig | null | undefined): boolean {
+  return Boolean(proxy && proxy.type !== 'none' && proxy.host?.trim())
+}
+
 export function hasProxyAuth(proxy: ProxyConfig | null | undefined): boolean {
   return Boolean(proxy?.username?.trim() && proxy?.password)
 }

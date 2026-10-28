@@ -12,6 +12,7 @@ import type {
   GmailLoginOptions,
   GmailLoginProgress,
   GmailPostSetupConfig,
+  DrivePdfLaneInfo,
   ImagePreview,
   LaunchResult,
   ProfileFilters,
@@ -23,6 +24,9 @@ import type {
 } from '../shared/types'
 import type { ImportGroupsResult } from '../shared/group-import'
 import type { DataImportPreview, DataImportResult } from '../shared/data-import'
+import type { DiskSpaceInfo } from '../shared/disk'
+import type { DbBackupInfo, UpdateCheckResult } from '../shared/app-ops'
+import type { WebLinkCheckProgress, WebLinkCheckResult, UrlListCheckResult } from '../shared/web-link'
 
 const api = {
   profiles: {
@@ -71,7 +75,10 @@ const api = {
       config: GmailPostSetupConfig
     ): Promise<{ path: string; config: GmailPostSetupConfig }> =>
       ipcRenderer.invoke(IPC.GMAIL_SETUP_SAVE, config),
+    listDrivePdfLanes: (): Promise<DrivePdfLaneInfo[]> =>
+      ipcRenderer.invoke(IPC.GMAIL_DRIVE_PDF_LANES),
     pickImageFile: (): Promise<string | null> => ipcRenderer.invoke(IPC.DIALOG_OPEN_IMAGE),
+    pickPdfFile: (): Promise<string | null> => ipcRenderer.invoke(IPC.DIALOG_OPEN_PDF),
     readImagePreview: (path: string): Promise<ImagePreview> =>
       ipcRenderer.invoke(IPC.FILE_IMAGE_PREVIEW, path),
     pickScriptTextFile: (): Promise<string | null> =>
@@ -118,7 +125,48 @@ const api = {
     get: (): Promise<AppSettings> => ipcRenderer.invoke(IPC.SETTINGS_GET),
     update: (patch: Partial<AppSettings>): Promise<AppSettings> =>
       ipcRenderer.invoke(IPC.SETTINGS_UPDATE, patch),
-    detectChrome: (): Promise<string> => ipcRenderer.invoke(IPC.SETTINGS_DETECT_CHROME)
+    detectChrome: (): Promise<string> => ipcRenderer.invoke(IPC.SETTINGS_DETECT_CHROME),
+    pickProfilesDir: (): Promise<string | null> =>
+      ipcRenderer.invoke(IPC.SETTINGS_PICK_PROFILES_DIR),
+    diskSpace: (paths?: string[]): Promise<DiskSpaceInfo[]> =>
+      ipcRenderer.invoke(IPC.SETTINGS_DISK_SPACE, paths),
+    openPath: (targetPath: string): Promise<{ ok: true } | { ok: false; error: string }> =>
+      ipcRenderer.invoke(IPC.SETTINGS_OPEN_PATH, targetPath)
+  },
+  app: {
+    info: (): Promise<{ name: string; version: string; packaged: boolean; backupDir: string }> =>
+      ipcRenderer.invoke(IPC.APP_INFO),
+    checkUpdates: (feedUrl?: string): Promise<UpdateCheckResult> =>
+      ipcRenderer.invoke(IPC.APP_CHECK_UPDATES, feedUrl),
+    installUpdate: (feedUrl?: string): Promise<{ ok: true } | { ok: false; error: string }> =>
+      ipcRenderer.invoke(IPC.APP_INSTALL_UPDATE, feedUrl)
+  },
+  backup: {
+    list: (): Promise<DbBackupInfo[]> => ipcRenderer.invoke(IPC.DATA_BACKUP_LIST),
+    exportFile: (): Promise<string | null> => ipcRenderer.invoke(IPC.DATA_BACKUP_EXPORT),
+    restoreFile: (): Promise<{ profiles: number; groups: number } | null> =>
+      ipcRenderer.invoke(IPC.DATA_BACKUP_RESTORE),
+    restoreNamed: (filePath: string): Promise<{ profiles: number; groups: number }> =>
+      ipcRenderer.invoke(IPC.DATA_BACKUP_RESTORE_FILE, filePath)
+  },
+  webLinks: {
+    load: (): Promise<{ content: string; path: string }> => ipcRenderer.invoke(IPC.WEB_LINKS_LOAD),
+    save: (content: string): Promise<{ path: string; count: number }> =>
+      ipcRenderer.invoke(IPC.WEB_LINKS_SAVE, content),
+    check: (content: string, target?: 'web' | 'form'): Promise<WebLinkCheckResult> =>
+      ipcRenderer.invoke(IPC.WEB_LINKS_CHECK, content, target),
+    checkList: (content: string, target?: 'all' | 'web' | 'form'): Promise<UrlListCheckResult> =>
+      ipcRenderer.invoke(IPC.WEB_LINKS_CHECK_LIST, content, target),
+    cancel: (): Promise<boolean> => ipcRenderer.invoke(IPC.WEB_LINKS_CANCEL),
+    pickFile: (): Promise<string | null> => ipcRenderer.invoke(IPC.WEB_LINKS_PICK),
+    exportFile: (content: string): Promise<string | null> =>
+      ipcRenderer.invoke(IPC.WEB_LINKS_EXPORT, content),
+    onProgress: (cb: (progress: WebLinkCheckProgress) => void): (() => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, progress: WebLinkCheckProgress): void =>
+        cb(progress)
+      ipcRenderer.on(IPC.WEB_LINKS_PROGRESS, listener)
+      return () => ipcRenderer.removeListener(IPC.WEB_LINKS_PROGRESS, listener)
+    }
   }
 }
 

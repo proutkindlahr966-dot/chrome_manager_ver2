@@ -161,6 +161,11 @@ export function hasGmailCredentials(creds: GmailCredentials | null | undefined):
   return Boolean(creds?.email?.trim() && creds?.password)
 }
 
+/** Đã nhập email trong hồ sơ (kể cả khi chưa có mật khẩu). */
+export function hasAttachedEmail(creds: GmailCredentials | null | undefined): boolean {
+  return Boolean(creds?.email?.trim())
+}
+
 /** Chuẩn hoá email để so trùng (1 mail = 1 profile) */
 export function normalizeEmailKey(email: string | null | undefined): string {
   return (email ?? '').trim().toLowerCase()

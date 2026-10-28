@@ -43,6 +43,9 @@ export function saveGmailList(content: string): { path: string; count: number } 
   return { path: filePath, count }
 }
 
+/** Giữ tối đa số email lỗi gần nhất — file chỉ để bỏ qua mail đã chạy. */
+const MAX_FAILED_EMAILS = 5000
+
 function normalizeFailedEmails(emails: string[]): string[] {
   const seen = new Set<string>()
   const result: string[] = []
@@ -54,7 +57,7 @@ function normalizeFailedEmails(emails: string[]): string[] {
     seen.add(key)
     result.push(email)
   }
-  return result
+  return result.length > MAX_FAILED_EMAILS ? result.slice(-MAX_FAILED_EMAILS) : result
 }
 
 /** Danh sách email đã chạy lỗi / bỏ qua (mỗi dòng 1 email) */
@@ -94,7 +97,10 @@ export function loadGmailSetup(): GmailPostSetupConfig {
       formTitle: typeof raw.formTitle === 'string' ? raw.formTitle : '',
       formDescription: typeof raw.formDescription === 'string' ? raw.formDescription : '',
       formHeaderPath: typeof raw.formHeaderPath === 'string' ? raw.formHeaderPath : '',
-      formLinkStyle: raw.formLinkStyle === 'long' ? 'long' : 'short'
+      formLinkEnabled: raw.formLinkEnabled !== false,
+      formLinkStyle: raw.formLinkStyle === 'long' ? 'long' : 'short',
+      drivePdfEnabled: Boolean(raw.drivePdfEnabled),
+      drivePdfPath: typeof raw.drivePdfPath === 'string' ? raw.drivePdfPath : ''
     }
   } catch {
     return { ...DEFAULT_GMAIL_POST_SETUP }
@@ -118,7 +124,10 @@ export function saveGmailSetup(config: GmailPostSetupConfig): {
     formTitle: config.formTitle ?? '',
     formDescription: config.formDescription ?? '',
     formHeaderPath: (config.formHeaderPath ?? '').trim(),
-    formLinkStyle: config.formLinkStyle === 'long' ? 'long' : 'short'
+    formLinkEnabled: config.formLinkEnabled !== false,
+    formLinkStyle: config.formLinkStyle === 'long' ? 'long' : 'short',
+    drivePdfEnabled: Boolean(config.drivePdfEnabled),
+    drivePdfPath: (config.drivePdfPath ?? '').trim()
   }
   writeFileSync(filePath, JSON.stringify(normalized, null, 2), 'utf-8')
   return { path: filePath, config: normalized }

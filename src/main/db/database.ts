@@ -11,11 +11,12 @@ import {
   statSync,
   writeFileSync
 } from 'fs'
-import { join, resolve, sep } from 'path'
+import { dirname, join, resolve, sep } from 'path'
 import { v4 as uuid } from 'uuid'
 import {
   AppSettings,
   BulkCreateProfileInput,
+  BulkResult,
   ChromeProfile,
   CreateGroupInput,
   CreateProfileInput,
@@ -28,6 +29,14 @@ import {
   UpdateProfileInput
 } from '../../shared/types'
 import { normalizeGmail } from '../../shared/gmail'
+import { clampStepSpeed, STEP_SPEED_DEFAULT } from '../../shared/step-speed'
+import {
+  collectProfilesRoots,
+  normalizeRootPath,
+  resolveCreateProfilesRoot,
+  SUGGESTED_EXTRA_PROFILES_ROOT,
+  uniqueRootPaths
+} from '../../shared/profile-roots'
 import {
   toCreateProfileInput,
   type ImportGroupsPayload,
@@ -64,6 +73,8 @@ interface StoreData {
   profiles: ChromeProfile[]
   groups: ProfileGroup[]
   settings: AppSettings
+  /** Ngày local YYYY-MM-DD → id hồ sơ đã mở hoặc đóng trong ngày đó. */
+  profileUsageDays?: Record<string, string[]>
 }
 
 function defaultSettings(): AppSettings {
@@ -73,8 +84,50 @@ function defaultSettings(): AppSettings {
     theme: 'system',
     defaultUserAgent: DEFAULT_USER_AGENT,
     closeOnExit: true,
-    maxConcurrentLaunches: 5
+    maxConcurrentLaunches: 5,
+    additionalProfilesRoots: [SUGGESTED_EXTRA_PROFILES_ROOT],
+    createProfilesRoot: SUGGESTED_EXTRA_PROFILES_ROOT,
+    stepSpeed: STEP_SPEED_DEFAULT,
+    updateFeedUrl: ''
   }
+}
+
+function localDateKey(at: Date): string {
+  const y = at.getFullYear()
+  const m = String(at.getMonth() + 1).padStart(2, '0')
+  const d = String(at.getDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
+}
+
+function addProfileUsage(days: Record<string, string[]>, profileId: string, at: Date): boolean {
+  if (Number.isNaN(at.getTime())) return false
+  const key = localDateKey(at)
+  const ids = days[key] ?? []
+  if (ids.includes(profileId)) return false
+  days[key] = [...ids, profileId]
+  return true
+}
+
+function pruneUsageDays(days: Record<string, string[]>): Record<string, string[]> {
+  const cutoff = new Date()
+  cutoff.setDate(cutoff.getDate() - 14)
+  const minKey = localDateKey(cutoff)
+  const next: Record<string, string[]> = {}
+  for (const [key, ids] of Object.entries(days)) {
+    if (key >= minKey && ids.length > 0) next[key] = ids
+  }
+  return next
+}
+
+function sanitizeUsageDays(value: unknown): Record<string, string[]> {
+  if (!value || typeof value !== 'object') return {}
+  const next: Record<string, string[]> = {}
+  for (const [key, ids] of Object.entries(value as Record<string, unknown>)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(key) || !Array.isArray(ids)) continue
+    const clean = [...new Set(ids.filter((id): id is string => typeof id === 'string' && id.length > 0))]
+    if (clean.length > 0) next[key] = clean
+  }
+  return pruneUsageDays(next)
 }
 
 export class Database {
@@ -82,6 +135,13 @@ export class Database {
   private data: StoreData
   private persistTimer: ReturnType<typeof setTimeout> | null = null
   private dirty = false
+  /** Nội dung đã nằm trên đĩa — bỏ qua lần ghi trùng nội dung. */
+  private lastPayload = ''
+  private mirrorTimer: ReturnType<typeof setTimeout> | null = null
+  private mirrorPayload: string | null = null
+  private lastMirrorPayload = ''
+  private batchDepth = 0
+  private pendingPersist: 'debounced' | 'immediate' | null = null
 
   constructor() {
     const dir = app.getPath('userData')
@@ -108,14 +168,16 @@ export class Database {
       return {
         profiles,
         groups: parsed.groups ?? [],
-        settings: { ...defaultSettings(), ...(parsed.settings ?? {}) }
+        settings: { ...defaultSettings(), ...(parsed.settings ?? {}) },
+        profileUsageDays: sanitizeUsageDays(parsed.profileUsageDays)
       }
     } catch {
       return null
     }
   }
 
-  /** Chuyển profilesRoot legacy (userData / project root / ổ cũ) → data/chrome-profiles */
+  /** Chuyển profilesRoot legacy (userData / project root) → data/chrome-profiles.
+   * Không đụng hồ sơ đang nằm trên ổ khác / thư mục bổ sung. */
   private migrateProfilesRootIfNeeded(): void {
     migrateLegacyDataDir('chrome-profiles')
     migrateLegacyDataDir('debug-screenshots')
@@ -125,21 +187,30 @@ export class Database {
       ? resolve(this.data.settings.profilesRoot)
       : ''
 
+    const extraRoots = collectProfilesRoots(this.data.settings)
+      .map((p) => resolve(p))
+      .filter((p) => p && p !== desired)
+
     const legacyPrefixes = [
-      currentResolved,
       resolve(join(app.getPath('userData'), 'chrome-profiles')),
       resolve(join(getProjectRoot(), 'chrome-profiles'))
-    ].filter((p, i, arr) => p && arr.indexOf(p) === i)
+    ].filter((p, i, arr) => p && arr.indexOf(p) === i && p !== desired && !extraRoots.includes(p))
 
     let changed = false
 
     this.data.profiles = this.data.profiles.map((profile) => {
+      const currentDir = resolve(profile.dataDir || '')
+      if (currentDir && existsSync(currentDir)) return profile
       const next = this.resolveProfileDataDir(profile, desired, legacyPrefixes)
       if (next.dataDir !== profile.dataDir) changed = true
       return next
     })
 
-    if (this.data.settings.profilesRoot !== desired) {
+    const hasCustomRoot = Boolean(currentResolved && currentResolved !== desired)
+    if (!currentResolved) {
+      this.data.settings.profilesRoot = desired
+      changed = true
+    } else if (!hasCustomRoot && extraRoots.length === 0 && this.data.settings.profilesRoot !== desired) {
       this.data.settings.profilesRoot = desired
       changed = true
     }
@@ -207,7 +278,8 @@ export class Database {
           updatedAt: now
         }
       ],
-      settings: defaultSettings()
+      settings: defaultSettings(),
+      profileUsageDays: {}
     }
   }
 
@@ -224,7 +296,11 @@ export class Database {
       this.persistTimer = null
     }
     this.dirty = false
-    const payload = JSON.stringify(this.serialize(data), null, 2)
+    const payload = JSON.stringify(this.serialize(data))
+    if (payload === this.lastPayload && existsSync(this.filePath)) {
+      this.scheduleMirror(payload)
+      return
+    }
     const tmpPath = `${this.filePath}.tmp`
     writeFileSync(tmpPath, payload, 'utf-8')
     try {
@@ -238,11 +314,28 @@ export class Database {
         // ignore
       }
     }
-    this.writePortableCopy(payload)
+    this.lastPayload = payload
+    this.scheduleMirror(payload)
+  }
+
+  /**
+   * Bản portable chỉ dùng khi copy project sang máy khác nên không cần ghi
+   * đồng bộ từng thay đổi — gộp lại, và luôn ghi khi flush / thoát app.
+   */
+  private scheduleMirror(payload: string): void {
+    if (payload === this.lastMirrorPayload) return
+    this.mirrorPayload = payload
+    if (this.mirrorTimer) return
+    this.mirrorTimer = setTimeout(() => {
+      this.mirrorTimer = null
+      this.writePortableCopy()
+    }, 2000)
   }
 
   /** Bản sao trong data/ — copy cả project sang máy khác vẫn còn tên nhóm/hồ sơ. */
-  private writePortableCopy(payload: string): void {
+  private writePortableCopy(): void {
+    const payload = this.mirrorPayload
+    if (payload === null || payload === this.lastMirrorPayload) return
     try {
       const portable = this.portableDbPath()
       const dir = getDataRoot()
@@ -255,6 +348,8 @@ export class Database {
         writeFileSync(portable, payload, 'utf-8')
         rmSync(tmp, { force: true })
       }
+      this.lastMirrorPayload = payload
+      this.mirrorPayload = null
     } catch (error) {
       console.error('[Database] Không ghi được bản portable', error)
     }
@@ -263,6 +358,10 @@ export class Database {
   /** Debounce ghi đĩa cho các cập nhật status liên tục. */
   private persistDebounced(): void {
     this.dirty = true
+    if (this.batchDepth > 0) {
+      if (this.pendingPersist === null) this.pendingPersist = 'debounced'
+      return
+    }
     if (this.persistTimer) return
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null
@@ -270,8 +369,33 @@ export class Database {
     }, 400)
   }
 
-  private persist(data = this.data): void {
-    this.persistImmediate(data)
+  private persist(): void {
+    if (this.batchDepth > 0) {
+      this.dirty = true
+      this.pendingPersist = 'immediate'
+      return
+    }
+    this.persistImmediate()
+  }
+
+  /**
+   * Gộp nhiều thay đổi thành một lần ghi đĩa.
+   * Thao tác hàng loạt (sửa / xóa / nhập nhiều hồ sơ) nếu ghi từng bước sẽ
+   * viết lại toàn bộ store N lần.
+   */
+  transaction<T>(fn: () => T): T {
+    this.batchDepth += 1
+    try {
+      return fn()
+    } finally {
+      this.batchDepth -= 1
+      if (this.batchDepth === 0) {
+        const mode = this.pendingPersist
+        this.pendingPersist = null
+        if (mode === 'immediate') this.persistImmediate()
+        else if (mode === 'debounced') this.persistDebounced()
+      }
+    }
   }
 
   /** Flush mọi thay đổi đang chờ — gọi trước khi thoát app. */
@@ -279,37 +403,81 @@ export class Database {
     if (this.dirty || this.persistTimer) {
       this.persistImmediate()
     }
+    if (this.mirrorTimer) {
+      clearTimeout(this.mirrorTimer)
+      this.mirrorTimer = null
+    }
+    this.writePortableCopy()
+  }
+
+  private listProfilesRoots(): string[] {
+    return collectProfilesRoots(this.normalizedSettings()).map((root) => resolve(root))
+  }
+
+  private getCreateProfilesRoot(): string {
+    const resolved = resolveCreateProfilesRoot(this.normalizedSettings())
+    return resolved ? resolve(resolved) : resolve(getDefaultProfilesRoot())
+  }
+
+  private normalizedSettings(): AppSettings {
+    const profilesRoot =
+      normalizeRootPath(this.data.settings.profilesRoot) || getDefaultProfilesRoot()
+    const additional = uniqueRootPaths(this.data.settings.additionalProfilesRoots ?? []).filter(
+      (root) => root.toLowerCase() !== profilesRoot.toLowerCase()
+    )
+    const create = resolveCreateProfilesRoot({
+      profilesRoot,
+      additionalProfilesRoots: additional,
+      createProfilesRoot: this.data.settings.createProfilesRoot
+    })
+    return {
+      ...this.data.settings,
+      profilesRoot,
+      additionalProfilesRoots: additional,
+      createProfilesRoot: create || profilesRoot,
+      stepSpeed: clampStepSpeed(this.data.settings.stepSpeed)
+    }
   }
 
   private ensureProfilesRoot(): void {
-    const root = this.data.settings.profilesRoot
-    if (!existsSync(root)) mkdirSync(root, { recursive: true })
+    for (const root of this.listProfilesRoots()) {
+      try {
+        if (!existsSync(root)) mkdirSync(root, { recursive: true })
+      } catch (error) {
+        console.error('[Database] Không tạo được thư mục hồ sơ', root, error)
+      }
+    }
   }
 
   /**
    * Gắn dataDir đúng thư mục UUID; nếu DB chưa có hồ sơ thì nhận toàn bộ folder.
    */
   private adoptOrphanChromeFolders(): boolean {
-    const root = resolve(this.getSettings().profilesRoot)
-    if (!existsSync(root)) return false
-    const folders = listProfileFolders(root)
+    const roots = this.listProfilesRoots()
     let changed = false
 
-    for (const folderName of folders) {
-      const dir = join(root, folderName)
-      const found = this.data.profiles.find((p) => p.id === folderName)
-      if (found) {
-        const nextDir = resolve(found.dataDir || dir)
-        if (nextDir !== resolve(dir) && !chromeUserDataLooksPopulated(nextDir) && existsSync(dir)) {
-          found.dataDir = dir
-          found.updatedAt = new Date().toISOString()
-          changed = true
+    for (const root of roots) {
+      if (!existsSync(root)) continue
+      const folders = listProfileFolders(root)
+      for (const folderName of folders) {
+        const dir = join(root, folderName)
+        const found = this.data.profiles.find((p) => p.id === folderName)
+        if (found) {
+          const nextDir = resolve(found.dataDir || dir)
+          if (nextDir !== resolve(dir) && !chromeUserDataLooksPopulated(nextDir) && existsSync(dir)) {
+            found.dataDir = dir
+            found.updatedAt = new Date().toISOString()
+            changed = true
+          }
         }
       }
     }
 
     if (this.data.profiles.length > 0) return changed
 
+    const root = this.getCreateProfilesRoot()
+    if (!existsSync(root)) return changed
+    const folders = listProfileFolders(root)
     let index = 0
     for (const folderName of folders) {
       if (this.data.profiles.some((p) => p.id === folderName)) continue
@@ -345,7 +513,7 @@ export class Database {
     const src = resolve(sourceDir)
     const dst = resolve(destDir)
     if (src === dst) return true
-    mkdirSync(this.getSettings().profilesRoot, { recursive: true })
+    mkdirSync(dirname(dst), { recursive: true })
     if (existsSync(dst)) {
       if (
         !replace &&
@@ -465,7 +633,7 @@ export class Database {
   }
 
   getSettings(): AppSettings {
-    return { ...this.data.settings }
+    return { ...this.normalizedSettings() }
   }
 
   updateSettings(patch: Partial<AppSettings>): AppSettings {
@@ -474,9 +642,54 @@ export class Database {
       const n = Math.floor(Number(patch.maxConcurrentLaunches)) || 1
       this.data.settings.maxConcurrentLaunches = Math.min(25, Math.max(1, n))
     }
+    if (patch.stepSpeed != null) {
+      this.data.settings.stepSpeed = clampStepSpeed(patch.stepSpeed)
+    }
+    if (patch.updateFeedUrl != null) {
+      this.data.settings.updateFeedUrl = String(patch.updateFeedUrl).trim().slice(0, 500)
+    }
+    if (
+      patch.profilesRoot != null ||
+      patch.additionalProfilesRoots != null ||
+      patch.createProfilesRoot != null
+    ) {
+      const next = this.normalizedSettings()
+      this.data.settings.profilesRoot = next.profilesRoot
+      this.data.settings.additionalProfilesRoots = next.additionalProfilesRoots
+      this.data.settings.createProfilesRoot = next.createProfilesRoot
+    }
     this.ensureProfilesRoot()
     this.persist()
     return this.getSettings()
+  }
+
+  updateWindowState(state: NonNullable<AppSettings['windowState']>): void {
+    this.data.settings.windowState = {
+      x: Math.round(state.x),
+      y: Math.round(state.y),
+      width: Math.max(800, Math.round(state.width)),
+      height: Math.max(560, Math.round(state.height)),
+      isMaximized: Boolean(state.isMaximized)
+    }
+    this.persistDebounced()
+  }
+
+  getStoreFilePath(): string {
+    return this.filePath
+  }
+
+  replaceFromBackup(sourcePath: string): { profiles: number; groups: number } {
+    const loaded = this.readStoreFile(sourcePath)
+    if (!loaded) throw new Error('File sao lưu không hợp lệ hoặc không đọc được')
+    this.flush()
+    this.data = loaded
+    this.migrateProfilesRootIfNeeded()
+    this.ensureProfilesRoot()
+    this.persistImmediate()
+    return {
+      profiles: this.data.profiles.length,
+      groups: this.data.groups.length
+    }
   }
 
   listGroups(): ProfileGroup[] {
@@ -606,7 +819,7 @@ export class Database {
     const now = new Date().toISOString()
     const id = uuid()
     const settings = this.getSettings()
-    const dataDir = join(settings.profilesRoot, id)
+    const dataDir = join(this.getCreateProfilesRoot(), id)
     mkdirSync(dataDir, { recursive: true })
     const gmail = normalizeGmail(input.gmail)
     this.assertGmailUnique(gmail, id)
@@ -691,6 +904,40 @@ export class Database {
     return updated
   }
 
+  /** Ghi hồ sơ đã dùng trong ngày local của `at` (mở hoặc đóng). */
+  noteProfileUsed(id: string, at: Date | string = new Date()): void {
+    this.rememberUsageFromLastLaunch()
+    const when = at instanceof Date ? at : new Date(at)
+    if (Number.isNaN(when.getTime())) return
+    if (!this.data.profiles.some((p) => p.id === id)) return
+    const days = { ...(this.data.profileUsageDays ?? {}) }
+    if (addProfileUsage(days, id, when)) {
+      this.data.profileUsageDays = pruneUsageDays(days)
+      this.persistDebounced()
+    }
+  }
+
+  /** Giữ các lần đóng đã có, để hôm qua không mất khi hồ sơ chạy lại hôm nay. */
+  rememberUsageFromLastLaunch(): void {
+    const days = { ...(this.data.profileUsageDays ?? {}) }
+    let changed = false
+    for (const profile of this.data.profiles) {
+      if (!profile.lastLaunchedAt) continue
+      if (addProfileUsage(days, profile.id, new Date(profile.lastLaunchedAt))) changed = true
+    }
+    if (!changed) return
+    this.data.profileUsageDays = pruneUsageDays(days)
+    this.persistDebounced()
+  }
+
+  countProfilesUsedOn(dayOffset: number): number {
+    const day = new Date()
+    day.setDate(day.getDate() - dayOffset)
+    const ids = this.data.profileUsageDays?.[localDateKey(day)] ?? []
+    const live = new Set(this.data.profiles.map((p) => p.id))
+    return ids.filter((id) => live.has(id)).length
+  }
+
   setProfileStatus(id: string, status: ProfileStatus, lastLaunchedAt?: string | null): ChromeProfile {
     const index = this.data.profiles.findIndex((p) => p.id === id)
     if (index < 0) throw new Error('Không tìm thấy hồ sơ')
@@ -713,6 +960,38 @@ export class Database {
     if (profile?.dataDir) {
       this.safeRemoveDataDir(profile.dataDir)
     }
+  }
+
+  /** Xóa nhiều hồ sơ trong 1 lần ghi đĩa. */
+  deleteProfiles(ids: string[]): void {
+    const wanted = new Set(ids)
+    const removed = this.data.profiles.filter((p) => wanted.has(p.id))
+    if (removed.length === 0) return
+    this.data.profiles = this.data.profiles.filter((p) => !wanted.has(p.id))
+    this.persist()
+    for (const profile of removed) {
+      if (profile.dataDir) this.safeRemoveDataDir(profile.dataDir)
+    }
+  }
+
+  /** Cập nhật nhiều hồ sơ trong 1 lần ghi đĩa. */
+  updateProfiles(ids: string[], input: UpdateProfileInput): BulkResult {
+    const successIds: string[] = []
+    const failed: BulkResult['failed'] = []
+    this.transaction(() => {
+      for (const id of ids) {
+        try {
+          this.updateProfile(id, input)
+          successIds.push(id)
+        } catch (error) {
+          failed.push({
+            id,
+            error: error instanceof Error ? error.message : 'Không thể cập nhật'
+          })
+        }
+      }
+    })
+    return { successIds, failed }
   }
 
   /**
@@ -742,13 +1021,14 @@ export class Database {
 
   private safeRemoveDataDir(dataDir: string): void {
     try {
-      const root = resolve(this.data.settings.profilesRoot)
       const dir = resolve(dataDir)
-      if (!isPathInside(dir, root) || dir === root) return
-      // Chỉ xóa thư mục con trực tiếp của profilesRoot (uuid)
-      const relative = dir.slice(root.length).replace(/^[\\/]/, '')
-      if (!relative || relative.includes(sep) || relative.includes('..')) return
-      rmSync(dir, { recursive: true, force: true })
+      for (const root of this.listProfilesRoots()) {
+        if (!isPathInside(dir, root) || dir === root) continue
+        const relative = dir.slice(root.length).replace(/^[\\/]/, '')
+        if (!relative || relative.includes(sep) || relative.includes('..')) continue
+        rmSync(dir, { recursive: true, force: true })
+        return
+      }
     } catch (error) {
       console.error('[Database] Không xóa được dataDir', dataDir, error)
     }
@@ -780,29 +1060,31 @@ export class Database {
     const groupIds: string[] = []
     let profilesCreated = 0
 
-    for (const item of payload.groups) {
-      const group = this.createGroup({
-        name: item.name,
-        color: item.color,
-        description: item.description,
-        restoreLastSession: item.restoreLastSession
-      })
-      groupIds.push(group.id)
+    this.transaction(() => {
+      for (const item of payload.groups) {
+        const group = this.createGroup({
+          name: item.name,
+          color: item.color,
+          description: item.description,
+          restoreLastSession: item.restoreLastSession
+        })
+        groupIds.push(group.id)
 
-      for (const profileItem of item.profiles ?? []) {
-        try {
-          const input = toCreateProfileInput(profileItem, group.id)
-          this.createProfile(input)
-          profilesCreated += 1
-        } catch (error) {
-          skipped.push({
-            groupName: group.name,
-            profileName: profileItem.name,
-            reason: error instanceof Error ? error.message : 'Không thể tạo hồ sơ'
-          })
+        for (const profileItem of item.profiles ?? []) {
+          try {
+            const input = toCreateProfileInput(profileItem, group.id)
+            this.createProfile(input)
+            profilesCreated += 1
+          } catch (error) {
+            skipped.push({
+              groupName: group.name,
+              profileName: profileItem.name,
+              reason: error instanceof Error ? error.message : 'Không thể tạo hồ sơ'
+            })
+          }
         }
       }
-    }
+    })
 
     return {
       groupsCreated: groupIds.length,
@@ -818,7 +1100,7 @@ export class Database {
     const folders = listFoldersForLayout(layout)
     const existingIds = new Set(this.data.profiles.map((p) => p.id))
     const orphanFolderCount = folders.filter((name) => !existingIds.has(name)).length
-    const destRoot = resolve(this.getSettings().profilesRoot)
+    const destRoot = resolve(this.getCreateProfilesRoot())
     const alreadyPresentNames = folders
       .map((name) => this.data.profiles.find((p) => p.id === name))
       .filter((p): p is ChromeProfile => {
@@ -862,7 +1144,7 @@ export class Database {
 
   private enrichImportLayout(layout: ReturnType<typeof resolveDataImportLayout>) {
     if (layout.dbPath && existsSync(layout.dbPath)) return layout
-    const destRoot = resolve(this.getSettings().profilesRoot)
+    const destRoot = resolve(this.getCreateProfilesRoot())
     const sameTree =
       resolve(layout.profilesDir) === destRoot ||
       resolve(layout.root) === resolve(getDataRoot())
@@ -897,7 +1179,7 @@ export class Database {
     options: DataImportOptions = {}
   ): DataImportResult {
     const layout = this.enrichImportLayout(resolveDataImportLayout(selectedPath))
-    const destRoot = resolve(this.getSettings().profilesRoot)
+    const destRoot = resolve(this.getCreateProfilesRoot())
     const sourceRoot = resolve(layout.profilesDir)
     const folders = listFoldersForLayout(layout)
     const existingIds = new Set(this.data.profiles.map((p) => p.id))
@@ -920,30 +1202,32 @@ export class Database {
     const fallbackGroupId = this.resolveImportGroupId(options.groupId)
 
     if (useSnapshot && mode === 'groups' && snapshot) {
-      for (const g of snapshot.groups) {
-        const already = this.data.groups.find(
-          (x) => x.id === g.id || x.name.trim().toLowerCase() === g.name.trim().toLowerCase()
-        )
-        if (already) {
-          groupIdMap.set(g.id, already.id)
-          continue
+      this.transaction(() => {
+        for (const g of snapshot.groups) {
+          const already = this.data.groups.find(
+            (x) => x.id === g.id || x.name.trim().toLowerCase() === g.name.trim().toLowerCase()
+          )
+          if (already) {
+            groupIdMap.set(g.id, already.id)
+            continue
+          }
+          try {
+            const created = this.createGroup({
+              name: g.name,
+              color: g.color,
+              description: g.description,
+              restoreLastSession: g.restoreLastSession
+            })
+            groupIdMap.set(g.id, created.id)
+            groupsCreated += 1
+          } catch (error) {
+            skipped.push({
+              name: g.name,
+              reason: error instanceof Error ? error.message : 'Không tạo được nhóm'
+            })
+          }
         }
-        try {
-          const created = this.createGroup({
-            name: g.name,
-            color: g.color,
-            description: g.description,
-            restoreLastSession: g.restoreLastSession
-          })
-          groupIdMap.set(g.id, created.id)
-          groupsCreated += 1
-        } catch (error) {
-          skipped.push({
-            name: g.name,
-            reason: error instanceof Error ? error.message : 'Không tạo được nhóm'
-          })
-        }
-      }
+      })
     }
 
     const snapshotProfiles = useSnapshot && snapshot?.profiles.length ? snapshot.profiles : null

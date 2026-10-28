@@ -51,6 +51,14 @@ export function getGmailSetupPath(): string {
   return join(getDataRoot(), 'gmail-setup.json')
 }
 
+export function getWebLinksPath(): string {
+  return join(getDataRoot(), 'web-links.txt')
+}
+
+export function getWebLinkCheckProfileDir(): string {
+  return join(getDataRoot(), 'link-check-chrome')
+}
+
 /** Di chuyển file/folder legacy từ project root → data/ (một lần). */
 export function migrateLegacyDataFile(fileName: string): void {
   const legacy = join(getProjectRoot(), fileName)

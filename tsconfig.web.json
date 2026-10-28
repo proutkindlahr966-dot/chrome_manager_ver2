@@ -4,6 +4,9 @@
     "src/renderer/src/**/*.tsx",
     "src/shared/**/*"
   ],
+  "exclude": [
+    "src/shared/**/*.test.ts"
+  ],
   "compilerOptions": {
     "composite": true,
     "jsx": "react-jsx",

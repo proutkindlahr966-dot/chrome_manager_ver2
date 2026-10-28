@@ -9,10 +9,11 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
-    "dist": "npm run build && electron-builder --win",
+    "dist": "npm run build && electron-builder --win --publish never",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "test": "vitest run",
     "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
@@ -23,6 +24,7 @@
     "lucide-react": "^0.469.0",
     "otpauth": "^9.5.1",
     "proxy-chain": "^2.7.1",
+    "electron-updater": "^6.6.2",
     "puppeteer-core": "^25.4.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
@@ -44,6 +46,7 @@
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.2",
-    "vite": "^5.4.11"
+    "vite": "^5.4.11",
+    "vitest": "^3.2.4"
   }
 }

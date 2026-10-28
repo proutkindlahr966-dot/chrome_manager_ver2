@@ -1,12 +1,12 @@
-import { FormEvent, useMemo, useState } from 'react'
-import { Download, Pencil, Plus, Trash2, Upload } from 'lucide-react'
+import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import { ArrowDown, ArrowUp, ArrowUpDown, Download, Pencil, Plus, RefreshCw, Search, Trash2, Upload } from 'lucide-react'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { Modal } from '@/components/ui/Modal'
 import { Switch } from '@/components/ui/Switch'
 import { useAppStore } from '@/stores/app-store'
 import { askConfirm, toast } from '@/stores/ui-store'
-import { GROUP_COLORS, type ProfileGroup } from '@shared/types'
+import { GROUP_COLORS, type ChromeProfile, type ProfileGroup, type ProfileStatusPatch } from '@shared/types'
 import {
   parseImportGroupsJson,
   summarizeImportPayload
@@ -14,10 +14,14 @@ import {
 import { summarizeDataImport, type DataImportPreview } from '@shared/data-import'
 import {
   DEFAULT_PROFILE_PREFIX,
+  cn,
   formatDate,
   formatProfileName,
+  formatRelative,
   suggestNextIndex
 } from '@/lib/utils'
+
+type GroupSortKey = 'name' | 'count' | 'lastUse' | 'updatedAt' | 'restore'
 
 const IMPORT_EXAMPLE = `{
   "version": 1,
@@ -40,7 +44,7 @@ const IMPORT_EXAMPLE = `{
 
 export function GroupsPage(): JSX.Element {
   const groups = useAppStore((s) => s.groups)
-  const profiles = useAppStore((s) => s.profiles)
+  const [groupProfiles, setGroupProfiles] = useState<ChromeProfile[]>([])
   const createGroup = useAppStore((s) => s.createGroup)
   const createProfiles = useAppStore((s) => s.createProfiles)
   const updateGroup = useAppStore((s) => s.updateGroup)
@@ -48,6 +52,7 @@ export function GroupsPage(): JSX.Element {
   const importGroups = useAppStore((s) => s.importGroups)
   const exportGroups = useAppStore((s) => s.exportGroups)
   const importDataPath = useAppStore((s) => s.importDataPath)
+  const refreshGroups = useAppStore((s) => s.refreshGroups)
   const settings = useAppStore((s) => s.settings)
 
   const [open, setOpen] = useState(false)
@@ -63,19 +68,148 @@ export function GroupsPage(): JSX.Element {
   const [importRaw, setImportRaw] = useState('')
   const [importing, setImporting] = useState(false)
   const [exporting, setExporting] = useState(false)
+  const [reloading, setReloading] = useState(false)
   const [dataPath, setDataPath] = useState('')
   const [dataPreview, setDataPreview] = useState<DataImportPreview | null>(null)
   const [dataPreviewError, setDataPreviewError] = useState<string | null>(null)
   const [importTab, setImportTab] = useState<'folder' | 'json'>('folder')
+  const [query, setQuery] = useState('')
+  const [sortKey, setSortKey] = useState<GroupSortKey>('name')
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
+
+  const loadGroupProfiles = useCallback(async (): Promise<void> => {
+    const all = await window.api.profiles.list()
+    setGroupProfiles(all)
+  }, [])
+
+  useEffect(() => {
+    void loadGroupProfiles()
+    return window.api.profiles.onStatusChanged((patch: ProfileStatusPatch) => {
+      setGroupProfiles((current) =>
+        current.map((profile) =>
+          profile.id === patch.id
+            ? {
+                ...profile,
+                status: patch.status,
+                lastLaunchedAt: patch.lastLaunchedAt,
+                updatedAt: patch.updatedAt
+              }
+            : profile
+        )
+      )
+    })
+  }, [loadGroupProfiles])
 
   const profileCountByGroup = useMemo(() => {
     const map = new Map<string, number>()
-    for (const p of profiles) {
-      if (!p.groupId) continue
-      map.set(p.groupId, (map.get(p.groupId) ?? 0) + 1)
+    for (const profile of groupProfiles) {
+      if (!profile.groupId) continue
+      map.set(profile.groupId, (map.get(profile.groupId) ?? 0) + 1)
     }
     return map
-  }, [profiles])
+  }, [groupProfiles])
+
+  const lastUseByGroup = useMemo(() => {
+    function isActive(profile: ChromeProfile): boolean {
+      return (
+        profile.status === 'running' ||
+        profile.status === 'starting' ||
+        profile.status === 'stopping'
+      )
+    }
+
+    const best = new Map<string, ChromeProfile>()
+    for (const profile of groupProfiles) {
+      if (!profile.groupId) continue
+      if (!profile.lastLaunchedAt && !isActive(profile)) continue
+      const current = best.get(profile.groupId)
+      if (!current) {
+        best.set(profile.groupId, profile)
+        continue
+      }
+      const nextAt = profile.lastLaunchedAt ?? ''
+      const currentAt = current.lastLaunchedAt ?? ''
+      if (nextAt > currentAt || (nextAt === currentAt && isActive(profile) && !isActive(current))) {
+        best.set(profile.groupId, profile)
+      }
+    }
+
+    const map = new Map<string, { name: string; at: string | null; active: boolean }>()
+    for (const [groupId, profile] of best) {
+      map.set(groupId, {
+        name: profile.name,
+        at: profile.lastLaunchedAt,
+        active: isActive(profile)
+      })
+    }
+    return map
+  }, [groupProfiles])
+
+  const visibleGroups = useMemo(() => {
+    const keyword = query.trim().toLowerCase()
+    const filtered = keyword
+      ? groups.filter((group) =>
+          `${group.name} ${group.description}`.toLowerCase().includes(keyword)
+        )
+      : groups
+
+    function lastUseTime(groupId: string): number {
+      const last = lastUseByGroup.get(groupId)
+      if (!last) return Number.NEGATIVE_INFINITY
+      if (last.at) {
+        const time = new Date(last.at).getTime()
+        if (!Number.isNaN(time)) return time
+      }
+      return last.active ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY
+    }
+
+    const sorted = [...filtered].sort((a, b) => {
+      let cmp = 0
+      if (sortKey === 'name') {
+        cmp = a.name.localeCompare(b.name, 'vi', { sensitivity: 'base' })
+      } else if (sortKey === 'count') {
+        cmp = (profileCountByGroup.get(a.id) ?? 0) - (profileCountByGroup.get(b.id) ?? 0)
+      } else if (sortKey === 'lastUse') {
+        cmp = lastUseTime(a.id) - lastUseTime(b.id)
+      } else if (sortKey === 'updatedAt') {
+        cmp = a.updatedAt.localeCompare(b.updatedAt)
+      } else {
+        cmp = Number(a.restoreLastSession !== false) - Number(b.restoreLastSession !== false)
+      }
+      if (cmp === 0) cmp = a.name.localeCompare(b.name, 'vi', { sensitivity: 'base' })
+      return sortDir === 'asc' ? cmp : -cmp
+    })
+    return sorted
+  }, [groups, query, sortKey, sortDir, profileCountByGroup, lastUseByGroup])
+
+  function toggleSort(key: GroupSortKey): void {
+    if (sortKey === key) {
+      setSortDir((dir) => (dir === 'asc' ? 'desc' : 'asc'))
+      return
+    }
+    setSortKey(key)
+    setSortDir(key === 'name' ? 'asc' : 'desc')
+  }
+
+  function sortHeader(key: GroupSortKey, label: string, className?: string): JSX.Element {
+    const active = sortKey === key
+    const Icon = !active ? ArrowUpDown : sortDir === 'asc' ? ArrowUp : ArrowDown
+    return (
+      <th className={cn('px-3 py-2.5 font-medium', className)}>
+        <button
+          type="button"
+          className={cn(
+            'inline-flex items-center gap-1 uppercase tracking-wide',
+            active ? 'text-ink' : 'hover:text-ink'
+          )}
+          onClick={() => toggleSort(key)}
+        >
+          {label}
+          <Icon size={12} className={active ? 'text-accent' : 'opacity-40'} />
+        </button>
+      </th>
+    )
+  }
 
   // Giống ProfileFormModal: tiền tố = tên nhóm, số bắt đầu từ 1 (nhóm mới)
   const namePrefix = name.trim() || DEFAULT_PROFILE_PREFIX
@@ -170,6 +304,7 @@ export function GroupsPage(): JSX.Element {
     setImporting(true)
     try {
       const result = await importDataPath(dataPath)
+      await loadGroupProfiles()
       const summary = summarizeDataImport(result)
       toast({
         tone: summary.tone,
@@ -194,6 +329,7 @@ export function GroupsPage(): JSX.Element {
     setImporting(true)
     try {
       const result = await importGroups(importRaw)
+      await loadGroupProfiles()
       const skipNote =
         result.skipped.length > 0
           ? ` Bỏ qua ${result.skipped.length} hồ sơ (thường do trùng email).`
@@ -213,6 +349,22 @@ export function GroupsPage(): JSX.Element {
       })
     } finally {
       setImporting(false)
+    }
+  }
+
+  async function onReload(): Promise<void> {
+    if (reloading) return
+    setReloading(true)
+    try {
+      await Promise.all([refreshGroups(), loadGroupProfiles()])
+    } catch (error) {
+      toast({
+        tone: 'error',
+        title: 'Không thể tải lại',
+        description: error instanceof Error ? error.message : undefined
+      })
+    } finally {
+      setReloading(false)
     }
   }
 
@@ -290,6 +442,7 @@ export function GroupsPage(): JSX.Element {
             count,
             startIndex: next
           })
+          await loadGroupProfiles()
           toast({
             tone: 'success',
             title: 'Đã tạo nhóm',
@@ -318,6 +471,15 @@ export function GroupsPage(): JSX.Element {
         description="Phân loại hồ sơ theo dự án, khách hàng hoặc mục đích vận hành."
         actions={
           <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={() => void onReload()}
+              disabled={reloading}
+            >
+              <RefreshCw size={16} className={reloading ? 'animate-spin' : undefined} />
+              {reloading ? 'Đang tải...' : 'Tải lại'}
+            </button>
             <button
               type="button"
               className="btn-secondary"
@@ -356,90 +518,170 @@ export function GroupsPage(): JSX.Element {
           }
         />
       ) : (
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          {groups.map((group) => {
-            const count = profileCountByGroup.get(group.id) ?? 0
-            return (
-              <div key={group.id} className="panel flex flex-col p-4">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex min-w-0 items-center gap-3">
-                    <span
-                      className="h-10 w-10 shrink-0 rounded-xl"
-                      style={{ backgroundColor: group.color }}
-                    />
-                    <div className="min-w-0">
-                      <div className="truncate font-display text-base font-semibold text-ink">
-                        {group.name}
-                      </div>
-                      <div className="text-xs text-ink-muted">{count} hồ sơ</div>
-                    </div>
-                  </div>
-                  <div className="flex gap-1">
-                    <button
-                      type="button"
-                      className="btn-ghost btn-icon"
-                      aria-label="Xuất nhóm"
-                      title="Xuất nhóm (JSON)"
-                      onClick={() => void onExportOne(group)}
-                    >
-                      <Download size={15} />
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-ghost btn-icon"
-                      aria-label="Sửa nhóm"
-                      onClick={() => openEdit(group)}
-                    >
-                      <Pencil size={15} />
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-ghost btn-icon text-danger"
-                      aria-label="Xóa nhóm"
-                      onClick={async () => {
-                        const ok = await askConfirm({
-                          title: `Xóa nhóm "${group.name}"?`,
-                          description:
-                            count > 0
-                              ? `Sẽ xóa vĩnh viễn ${count} hồ sơ trong nhóm (kèm dữ liệu Chrome). Không thể hoàn tác.`
-                              : 'Nhóm này không có hồ sơ. Bạn có chắc muốn xóa?',
-                          confirmLabel: 'Xóa nhóm',
-                          danger: true
-                        })
-                        if (!ok) return
-                        await deleteGroup(group.id)
-                        toast({
-                          tone: 'success',
-                          title: 'Đã xóa nhóm',
-                          description:
-                            count > 0 ? `Đã xóa ${count} hồ sơ trong nhóm.` : undefined
-                        })
-                      }}
-                    >
-                      <Trash2 size={15} />
-                    </button>
-                  </div>
-                </div>
-                <p className="mt-3 min-h-[40px] flex-1 text-sm leading-relaxed text-ink-muted">
-                  {group.description || 'Không có mô tả'}
-                </p>
-                <div className="mt-auto space-y-3 border-t border-line pt-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-xs text-ink-muted">
-                      Tab cũ: {group.restoreLastSession ? 'Bật' : 'Tắt'}
-                    </span>
-                    <Switch
-                      checked={group.restoreLastSession}
-                      label="Tab cũ"
-                      title="Mở lại tab lần chạy trước cho cả nhóm"
-                      onChange={(next) => void updateGroup(group.id, { restoreLastSession: next })}
-                    />
-                  </div>
-                  <div className="text-xs text-ink-muted">Cập nhật {formatDate(group.updatedAt)}</div>
-                </div>
-              </div>
-            )
-          })}
+        <div className="space-y-3">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="relative min-w-0 sm:max-w-sm sm:flex-1">
+              <Search
+                size={15}
+                className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink-muted"
+              />
+              <input
+                className="input pl-9"
+                placeholder="Tìm theo tên hoặc mô tả nhóm..."
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+              />
+            </div>
+            <div className="text-xs text-ink-muted">
+              {query.trim()
+                ? `${visibleGroups.length} / ${groups.length} nhóm`
+                : `${groups.length} nhóm`}
+            </div>
+          </div>
+
+          <div className="panel overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[860px] text-left text-sm">
+                <thead className="sticky top-0 z-[1] bg-surface-muted/95 text-xs uppercase tracking-wide text-ink-muted backdrop-blur-sm">
+                  <tr>
+                    {sortHeader('name', 'Nhóm')}
+                    {sortHeader('count', 'Hồ sơ', 'w-20')}
+                    {sortHeader('lastUse', 'Lần dùng cuối')}
+                    {sortHeader('updatedAt', 'Cập nhật')}
+                    {sortHeader('restore', 'Tab cũ', 'w-24')}
+                    <th className="w-28 px-3 py-2.5 text-right font-medium">Thao tác</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleGroups.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="px-3 py-8 text-center text-sm text-ink-muted">
+                        Không có nhóm khớp “{query.trim()}”.
+                      </td>
+                    </tr>
+                  ) : (
+                    visibleGroups.map((group) => {
+                      const count = profileCountByGroup.get(group.id) ?? 0
+                      const lastUse = lastUseByGroup.get(group.id) ?? null
+                      const lastUseLabel = !lastUse
+                        ? 'Chưa chạy'
+                        : lastUse.at
+                          ? `${formatDate(lastUse.at)} · ${lastUse.name}`
+                          : `Đang chạy · ${lastUse.name}`
+                      const lastUseTitle = !lastUse
+                        ? 'Chưa có hồ sơ nào trong nhóm được chạy'
+                        : lastUse.active
+                          ? `${lastUse.name} đang chạy${lastUse.at ? ` · ${formatRelative(lastUse.at)}` : ''}`
+                          : `${lastUse.name} · ${formatRelative(lastUse.at)}`
+                      return (
+                        <tr
+                          key={group.id}
+                          className="border-t border-line transition hover:bg-surface-muted/40"
+                        >
+                          <td className="px-3 py-2 align-middle">
+                            <div className="flex min-w-0 items-center gap-2.5">
+                              <span
+                                className="h-2.5 w-2.5 shrink-0 rounded-full"
+                                style={{ backgroundColor: group.color }}
+                              />
+                              <div className="min-w-0">
+                                <div className="truncate font-medium text-ink">{group.name}</div>
+                                {group.description ? (
+                                  <div className="truncate text-xs text-ink-muted">
+                                    {group.description}
+                                  </div>
+                                ) : null}
+                              </div>
+                            </div>
+                          </td>
+                          <td className="whitespace-nowrap px-3 py-2 align-middle text-ink-soft">
+                            {count}
+                          </td>
+                          <td
+                            className="max-w-[240px] px-3 py-2 align-middle text-xs text-ink-muted"
+                            title={lastUseTitle}
+                          >
+                            <div className="truncate">{lastUseLabel}</div>
+                          </td>
+                          <td className="whitespace-nowrap px-3 py-2 align-middle text-xs text-ink-muted">
+                            {formatDate(group.updatedAt)}
+                          </td>
+                          <td className="px-3 py-2 align-middle">
+                            <Switch
+                              size="sm"
+                              checked={group.restoreLastSession}
+                              label="Tab cũ"
+                              title="Mở lại tab lần chạy trước cho cả nhóm"
+                              onChange={(next) =>
+                                void updateGroup(group.id, { restoreLastSession: next })
+                              }
+                            />
+                          </td>
+                          <td className="px-3 py-2 align-middle">
+                            <div className="flex justify-end gap-0.5">
+                              <button
+                                type="button"
+                                className="btn-ghost btn-icon"
+                                aria-label="Xuất nhóm"
+                                title="Xuất nhóm (JSON)"
+                                onClick={() => void onExportOne(group)}
+                              >
+                                <Download size={15} />
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-ghost btn-icon"
+                                aria-label="Sửa nhóm"
+                                onClick={() => openEdit(group)}
+                              >
+                                <Pencil size={15} />
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-ghost btn-icon text-danger"
+                                aria-label="Xóa nhóm"
+                                onClick={async () => {
+                                  const ok = await askConfirm({
+                                    title: `Xóa nhóm "${group.name}"?`,
+                                    description:
+                                      count > 0
+                                        ? `Sẽ xóa vĩnh viễn ${count} hồ sơ trong nhóm (kèm dữ liệu Chrome). Không thể hoàn tác.`
+                                        : 'Nhóm này không có hồ sơ. Bạn có chắc muốn xóa?',
+                                    confirmLabel: 'Xóa nhóm',
+                                    danger: true
+                                  })
+                                  if (!ok) return
+                                  try {
+                                    await deleteGroup(group.id)
+                                    await loadGroupProfiles()
+                                    toast({
+                                      tone: 'success',
+                                      title: 'Đã xóa nhóm',
+                                      description:
+                                        count > 0 ? `Đã xóa ${count} hồ sơ trong nhóm.` : undefined
+                                    })
+                                  } catch (error) {
+                                    toast({
+                                      tone: 'error',
+                                      title: 'Không thể xóa nhóm',
+                                      description:
+                                        error instanceof Error ? error.message : undefined
+                                    })
+                                  }
+                                }}
+                              >
+                                <Trash2 size={15} />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      )
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       )}
 

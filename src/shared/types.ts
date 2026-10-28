@@ -103,6 +103,7 @@ export interface ProfileFilters {
   search?: string
   groupId?: string | null
   status?: ProfileStatus | 'all'
+  proxy?: 'all' | 'with' | 'without'
   sortBy?: 'name' | 'createdAt' | 'updatedAt' | 'lastLaunchedAt'
   sortDir?: 'asc' | 'desc'
 }
@@ -110,6 +111,10 @@ export interface ProfileFilters {
 export interface DashboardStats {
   totalProfiles: number
   runningProfiles: number
+  /** Hồ sơ đã đóng tab hôm nay, hoặc đang mở. */
+  ranToday: number
+  /** Hồ sơ đã mở hoặc đóng vào ngày hôm trước. */
+  ranYesterday: number
   idleProfiles: number
   totalGroups: number
   withGmail: number
@@ -128,11 +133,34 @@ export interface DashboardStats {
 
 export interface AppSettings {
   chromePath: string
+  /** Thư mục gốc ban đầu — hồ sơ cũ vẫn nằm đây. */
   profilesRoot: string
+  /** Các thư mục thêm (ổ khác) — chạy song song với thư mục gốc. */
+  additionalProfilesRoots: string[]
+  /** Thư mục dùng khi tạo hồ sơ mới. Phải là profilesRoot hoặc một extra. */
+  createProfilesRoot: string
   theme: 'light' | 'dark' | 'system'
   defaultUserAgent: string
   closeOnExit: boolean
   maxConcurrentLaunches: number
+  /**
+   * Tốc độ các bước tự động (login Gmail, avatar, Sheet, Form…).
+   * 1 = bình thường. Lớn hơn thì nhanh hơn, nhỏ hơn thì chậm hơn.
+   */
+  stepSpeed: number
+  /** Kích thước / vị trí cửa sổ app (khôi phục lần mở sau). */
+  windowState?: {
+    x: number
+    y: number
+    width: number
+    height: number
+    isMaximized: boolean
+  }
+  /**
+   * URL generic feed cho electron-updater (thư mục chứa latest.yml).
+   * Trống = không kiểm tra cập nhật tự động.
+   */
+  updateFeedUrl: string
 }
 
 export interface WindowBounds {
@@ -179,8 +207,16 @@ export interface GmailLoginOptions {
   formDescription?: string
   /** Ảnh header Google Form (upload qua Customize theme) */
   formHeaderPath?: string
+  /** Bật bước Publish / lấy đường link Form */
+  formLinkEnabled?: boolean
   /** Link Form sau Publish: short = forms.gle · long = docs.google.com/.../viewform */
   formLinkStyle?: FormLinkStyle
+  /** Bật bước mở Drive, upload PDF, Share lấy link */
+  drivePdfEnabled?: boolean
+  /** Folder PDF: hồ sơ 1–2 = Lan1, 3–4 = Lan2, … (1–10) */
+  drivePdfLane?: number
+  /** Đường dẫn file PDF tuyệt đối (không dùng khi đã có drivePdfLane) */
+  drivePdfPath?: string
 }
 
 /** Kiểu link công khai sau Publish Form */
@@ -201,8 +237,14 @@ export interface GmailPostSetupConfig {
   formDescription: string
   /** Ảnh header Form (Customize theme → Header → Upload) */
   formHeaderPath: string
+  /** Bật Publish và lấy đường link Form (short/long) */
+  formLinkEnabled: boolean
   /** Link Form khi Publish: ngắn (forms.gle) hoặc dài (viewform) */
   formLinkStyle: FormLinkStyle
+  /** Bật mở My Drive → upload PDF → Share → lấy link */
+  drivePdfEnabled: boolean
+  /** File PDF sẽ upload lên Drive */
+  drivePdfPath: string
 }
 
 export const DEFAULT_GMAIL_POST_SETUP: GmailPostSetupConfig = {
@@ -214,7 +256,17 @@ export const DEFAULT_GMAIL_POST_SETUP: GmailPostSetupConfig = {
   formTitle: '',
   formDescription: '',
   formHeaderPath: '',
-  formLinkStyle: 'short'
+  formLinkEnabled: true,
+  formLinkStyle: 'short',
+  drivePdfEnabled: false,
+  drivePdfPath: ''
+}
+
+/** Một folder Lan1–Lan10 trong data/File_PDF */
+export interface DrivePdfLaneInfo {
+  lane: number
+  folder: string
+  fileName: string
 }
 
 /** Xem trước ảnh trong renderer — dataUrl rỗng khi file quá lớn */
