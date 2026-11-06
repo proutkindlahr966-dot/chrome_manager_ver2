@@ -73,7 +73,10 @@ export const IPC = {
   WEB_LINKS_CANCEL: 'webLinks:cancel',
   WEB_LINKS_PROGRESS: 'webLinks:progress',
   WEB_LINKS_PICK: 'webLinks:pick',
-  WEB_LINKS_EXPORT: 'webLinks:export'
+  WEB_LINKS_EXPORT: 'webLinks:export',
+  WEB_LINKS_KEEPALIVE_SET: 'webLinks:keepAliveSet',
+  WEB_LINKS_KEEPALIVE_STATUS: 'webLinks:keepAliveStatus',
+  WEB_LINKS_KEEPALIVE_EVENT: 'webLinks:keepAliveEvent'
 } as const
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC]

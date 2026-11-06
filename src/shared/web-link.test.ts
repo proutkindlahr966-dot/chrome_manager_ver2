@@ -3,17 +3,24 @@ import {
   applyWebLinkStatuses,
   classifyFormLinkPage,
   classifyWebLinkPage,
+  collectUniqueCheckItems,
   collectUniqueFormUrls,
   collectUniqueWebUrls,
   isPublicHttpUrl,
   isWebLinkHeaderLine,
   mapUrlListResults,
   normalizeWebUrl,
+  omitMatchingRawLines,
   parseUrlListLines,
   parseWebLinkText,
   summarizeUrlList,
   classifySnapshotToProbe,
   httpStatusNeedsBrowser,
+  isRenderHost,
+  pageLooksRenderWaking,
+  clampRenderKeepAliveMinutes,
+  RENDER_KEEPALIVE_INTERVAL_MS,
+  shouldWaitForRenderWake,
   WEB_LINK_STATUS_ACTIVE,
   WEB_LINK_STATUS_INACTIVE
 } from './web-link'
@@ -112,7 +119,48 @@ describe('web-link classify', () => {
     expect(result).toEqual({ verdict: 'inactive', reason: 'netlify_not_found' })
   })
 
-  it('Trang web nguy hiểm (Cốc Cốc / Safe Browsing)', () => {
+  it('Chrome chặn Render bằng trang đỏ Trang web nguy hiểm', () => {
+    const html = `
+      <h1>Trang web nguy hiểm</h1>
+      <p>Những kẻ tấn công trên trang web bạn đã cố truy cập có thể lừa bạn cài đặt phần mềm hoặc tiết lộ các thông tin như mật khẩu, số điện thoại hoặc số thẻ tín dụng.</p>
+      <p>Bật chế độ bảo vệ nâng cao để có được cấp độ bảo mật cao nhất của Chrome</p>
+      <button>Chi tiết</button>
+      <button>Quay lại trang an toàn</button>
+    `
+    const result = classifyWebLinkPage({
+      finalUrl: 'chrome-error://chromewebdata/',
+      statusCode: 0,
+      title: 'Lỗi bảo mật',
+      bodyText: 'Trang web nguy hiểm. Quay lại trang an toàn',
+      html
+    })
+    expect(result).toEqual({ verdict: 'inactive', reason: 'dangerous_site' })
+    expect(
+      classifySnapshotToProbe(
+        {
+          finalUrl: 'chrome-error://chromewebdata/',
+          statusCode: 0,
+          title: 'Lỗi bảo mật',
+          bodyText: 'Trang web nguy hiểm. Quay lại trang an toàn',
+          html
+        },
+        'web'
+      ).errorCode
+    ).toBe('dangerous_site')
+  })
+
+  it('trang lỗi mạng của Chrome không bị tính là trang nguy hiểm', () => {
+    const result = classifyWebLinkPage({
+      finalUrl: 'chrome-error://chromewebdata/',
+      statusCode: 0,
+      title: 'Không thể truy cập trang web này',
+      bodyText: 'Không thể truy cập trang web này. ERR_CONNECTION_REFUSED',
+      html: ''
+    })
+    expect(result).toEqual({ verdict: 'active', reason: null })
+  })
+
+  it('Trang web nguy hiểm (Safe Browsing)', () => {
     const result = classifyWebLinkPage({
       finalUrl: 'https://phish.example/',
       statusCode: 200,
@@ -171,6 +219,40 @@ describe('web-link classify', () => {
     expect(result).toEqual({ verdict: 'active', reason: null })
   })
 
+  it('nhận màn hình Render đang thức dậy và bỏ qua khi loại Netlify', () => {
+    const waking = {
+      finalUrl: 'https://bluebadge-ownershipvalidation.onrender.com/recaptcha',
+      statusCode: 200,
+      title: 'Render',
+      bodyText: '19:55:23 INCOMING HTTP REQUEST DETECTED\n19:55:26 SERVICE WAKING UP\nAPPLICATION LOADING',
+      html: '<html><body>START BUILDING ON RENDER TODAY</body></html>'
+    }
+    expect(isRenderHost(waking.finalUrl)).toBe(true)
+    expect(pageLooksRenderWaking(waking)).toBe(true)
+    expect(shouldWaitForRenderWake(waking, 'render')).toBe(true)
+    expect(shouldWaitForRenderWake(waking, 'netlify')).toBe(false)
+    expect(pageLooksRenderWaking({
+      finalUrl: 'https://bluebadge-ownershipvalidation.onrender.com/recaptcha',
+      statusCode: 502,
+      title: '',
+      bodyText: '',
+      html: ''
+    })).toBe(true)
+    expect(pageLooksRenderWaking({
+      finalUrl: 'https://site.netlify.app/recaptcha',
+      statusCode: 200,
+      title: 'Recaptcha',
+      bodyText: 'Verify you are human',
+      html: '<html><body>ok</body></html>'
+    })).toBe(false)
+    expect(RENDER_KEEPALIVE_INTERVAL_MS).toBe(14 * 60 * 1000)
+    expect(clampRenderKeepAliveMinutes(14)).toBe(14)
+    expect(clampRenderKeepAliveMinutes(1.4)).toBe(1)
+    expect(clampRenderKeepAliveMinutes(0)).toBe(1)
+    expect(clampRenderKeepAliveMinutes(30)).toBe(14)
+    expect(clampRenderKeepAliveMinutes(Number.NaN)).toBe(14)
+  })
+
   it('trang bình thường là đang hoạt động', () => {
     const result = classifyWebLinkPage({
       finalUrl: 'https://docs.google.com/forms/d/e/xxx/viewform',
@@ -211,14 +293,75 @@ describe('url list output', () => {
       ]
     ])
     const out = mapUrlListResults(lines, byKey)
-    expect(out.map((r) => r.verdict)).toEqual(['valid', 'skipped', 'error', 'valid', 'error'])
+    expect(out.map((r) => r.verdict)).toEqual(['valid', 'skipped', 'error', 'valid', 'skipped'])
     expect(out[2].errorCode).toBe('netlify_not_found')
     expect(out[2].webError).toBe(true)
     expect(out[2].formError).toBe(false)
     expect(out[3].url).toBe('https://a.com')
-    expect(out[4].errorCode).toBe('invalid_url')
+    expect(out[4].verdict).toBe('skipped')
     const summary = summarizeUrlList(out)
-    expect(summary).toEqual({ valid: 2, error: 2, skipped: 1, formError: 0, webError: 1 })
+    expect(summary).toEqual({ valid: 2, error: 1, skipped: 2, formError: 0, webError: 1 })
+  })
+
+  it('bỏ qua tiêu đề, tên nhóm và ký tự phân cách, chỉ kiểm tra URL', () => {
+    const text = [
+      'TỐI 10.30 (TEST LINK)',
+      '———',
+      'IT',
+      'https://accountsecurity-verification.onrender.com/recaptcha',
+      'https://bluebadge-trustcredentials.onrender.com/recaptcha',
+      '——-',
+      'MX',
+      'https://bluebadge-ownershipvalidation.onrender.com/recaptcha',
+      'https://bluebadge-digitalidentityhub-k71y.onrender.com/recaptcha'
+    ].join('\n')
+    const lines = parseUrlListLines(text)
+    expect(lines.map((row) => row.urls.map((item) => item.url))).toEqual([
+      [],
+      [],
+      [],
+      ['https://accountsecurity-verification.onrender.com/recaptcha'],
+      ['https://bluebadge-trustcredentials.onrender.com/recaptcha'],
+      [],
+      [],
+      ['https://bluebadge-ownershipvalidation.onrender.com/recaptcha'],
+      ['https://bluebadge-digitalidentityhub-k71y.onrender.com/recaptcha']
+    ])
+    const unique = collectUniqueCheckItems(lines, 'web')
+    expect(unique).toHaveLength(4)
+    const out = mapUrlListResults(lines, new Map())
+    expect(out.filter((row) => row.verdict === 'skipped')).toHaveLength(5)
+    expect(out.filter((row) => row.verdict === 'error').every((row) => row.errorCode !== 'invalid_url')).toBe(true)
+  })
+
+  it('gỡ dòng lỗi khỏi danh sách và giữ tiêu đề, nhóm', () => {
+    const text = [
+      'TỐI 10.30 (TEST LINK)',
+      '———',
+      'https://bluecheck-accountverification.onrender.com/recaptcha',
+      'IT',
+      'https://bluebadge-ownershipvalidation.onrender.com/recaptcha'
+    ].join('\n')
+    const { text: next, removed } = omitMatchingRawLines(text, [
+      'https://bluecheck-accountverification.onrender.com/recaptcha'
+    ])
+    expect(removed).toBe(1)
+    expect(next.split('\n')).toEqual([
+      'TỐI 10.30 (TEST LINK)',
+      '———',
+      'IT',
+      'https://bluebadge-ownershipvalidation.onrender.com/recaptcha'
+    ])
+  })
+
+  it('gỡ từng lần xuất hiện khi cùng một dòng lỗi lặp lại', () => {
+    const text = 'https://a.onrender.com/recaptcha\nhttps://a.onrender.com/recaptcha\nMX'
+    const { text: next, removed } = omitMatchingRawLines(text, [
+      'https://a.onrender.com/recaptcha',
+      'https://a.onrender.com/recaptcha'
+    ])
+    expect(removed).toBe(2)
+    expect(next).toBe('MX')
   })
 
   it('giữ nguyên dòng Link_form|Nhóm|Link_web, tách lỗi form/web', () => {

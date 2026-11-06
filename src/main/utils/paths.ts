@@ -55,6 +55,14 @@ export function getWebLinksPath(): string {
   return join(getDataRoot(), 'web-links.txt')
 }
 
+export function getWebLinksKindPath(kind: 'netlify' | 'render'): string {
+  return join(getDataRoot(), kind === 'render' ? 'web-links-render.txt' : 'web-links-netlify.txt')
+}
+
+export function getWebLinkKeepAlivePath(): string {
+  return join(getDataRoot(), 'web-link-keepalive.json')
+}
+
 export function getWebLinkCheckProfileDir(): string {
   return join(getDataRoot(), 'link-check-chrome')
 }

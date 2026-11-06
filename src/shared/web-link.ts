@@ -3,6 +3,26 @@ export const WEB_LINK_STATUS_ACTIVE = 'Hoạt động'
 export const WEB_LINK_STATUS_INACTIVE = 'Không hoạt động'
 export const WEB_LINKS_MAX_UNIQUE = 400
 
+/** Loại máy chủ của Link_web. Render miễn phí ngủ sau khoảng 15 phút không có request. */
+export type WebLinkHostKind = 'netlify' | 'render'
+
+export const RENDER_KEEPALIVE_DEFAULT_MINUTES = 14
+export const RENDER_KEEPALIVE_MIN_MINUTES = 1
+export const RENDER_KEEPALIVE_MAX_MINUTES = 14
+export const RENDER_KEEPALIVE_INTERVAL_MS = RENDER_KEEPALIVE_DEFAULT_MINUTES * 60 * 1000
+export const RENDER_WAKE_TIMEOUT_MS = 3 * 60 * 1000
+export const RENDER_WAKE_POLL_MS = 5_000
+/** Chrome có thể hiện "Trang web nguy hiểm" vài giây sau khi server Render đã chạy. */
+export const RENDER_DANGER_SETTLE_MS = 6_000
+
+export function clampRenderKeepAliveMinutes(value: number): number {
+  if (!Number.isFinite(value)) return RENDER_KEEPALIVE_DEFAULT_MINUTES
+  const rounded = Math.round(value)
+  if (rounded < RENDER_KEEPALIVE_MIN_MINUTES) return RENDER_KEEPALIVE_MIN_MINUTES
+  if (rounded > RENDER_KEEPALIVE_MAX_MINUTES) return RENDER_KEEPALIVE_MAX_MINUTES
+  return rounded
+}
+
 export type WebLinkCheckTarget = 'web' | 'form'
 export type WebLinkUrlField = 'linkWeb' | 'linkForm'
 export type WebLinkInactiveReason = 'netlify_not_found' | 'dangerous_site' | 'google_tos_violation'
@@ -54,6 +74,23 @@ export interface WebLinkCheckProgress {
   url: string
   verdict: 'active' | 'inactive' | 'error' | 'skipped'
   reason?: WebLinkInactiveReason | null
+  message?: string
+}
+
+export interface WebLinkKeepAliveStatus {
+  /** Người dùng bật nút tự làm mới. */
+  auto: boolean
+  /** Job đang được lên lịch (đang ở loại Render, có Link_web, và nút đang bật). */
+  enabled: boolean
+  intervalMs: number
+  urlCount: number
+  running: boolean
+  lastRunAt: number | null
+  nextRunAt: number | null
+  lastOk: number
+  lastFail: number
+  /** Dòng vừa gỡ vì trang nguy hiểm trong lượt làm mới. */
+  removedLines?: UrlLineResult[]
 }
 
 export interface WebLinkCheckResult {
@@ -223,12 +260,14 @@ export function pageLooksDangerous(snapshot: WebLinkPageSnapshot): boolean {
     .join('\n')
     .toLowerCase()
 
-  if (blob.includes('chrome-error://chromewebdata')) return true
   if (blob.includes('interstitial-wrapper')) return true
   if (blob.includes('visited-page-is-dangerous')) return true
   if (blob.includes('safebrowsing-interstitial')) return true
   if (blob.includes('trang web nguy hiểm') || blob.includes('trang web nguy hiem')) return true
   if (blob.includes('quay lại trang an toàn') || blob.includes('quay lai trang an toan')) return true
+  if (blob.includes('bảo vệ tăng cường') || blob.includes('bao ve tang cuong')) return true
+  if (blob.includes('bảo vệ nâng cao') || blob.includes('bao ve nang cao')) return true
+  if (blob.includes('lừa bạn cài đặt phần mềm') || blob.includes('lua ban cai dat phan mem')) return true
   if (blob.includes('deceptive site ahead')) return true
   if (/\bdangerous site\b/.test(blob)) return true
   if (blob.includes('attackers on the site')) return true
@@ -259,6 +298,45 @@ export function pageLooksNetlifyMissing(snapshot: WebLinkPageSnapshot): boolean 
   const onNetlifyHost = /netlify\.app|netlify\.com/.test(snapshot.finalUrl.toLowerCase())
   if (onNetlifyHost && snapshot.statusCode === 404) return true
   return false
+}
+
+export function isRenderHost(raw: string): boolean {
+  const withScheme = ensureHttpUrl(raw)
+  if (!withScheme) return false
+  try {
+    const host = new URL(withScheme).hostname.toLowerCase()
+    return host === 'onrender.com' || host.endsWith('.onrender.com')
+  } catch {
+    return false
+  }
+}
+
+/** Trang chờ của Render khi instance miễn phí đang thức dậy (ảnh splash tối, Application loading). */
+export function pageLooksRenderWaking(snapshot: WebLinkPageSnapshot): boolean {
+  const blob = [snapshot.finalUrl, snapshot.title, snapshot.bodyText, snapshot.html]
+    .join('\n')
+    .toLowerCase()
+
+  if (blob.includes('service waking up')) return true
+  if (blob.includes('incoming http request detected')) return true
+  if (blob.includes('start building on render')) return true
+  if (blob.includes('application loading') && (blob.includes('onrender') || blob.includes('render'))) {
+    return true
+  }
+
+  const onRender = isRenderHost(snapshot.finalUrl) || blob.includes('.onrender.com')
+  if (!onRender) return false
+  if (snapshot.statusCode === 502 || snapshot.statusCode === 503) return true
+  if (blob.includes('bad gateway')) return true
+  if (blob.includes('no available server')) return true
+  return false
+}
+
+export function shouldWaitForRenderWake(
+  snapshot: WebLinkPageSnapshot,
+  hostKind: WebLinkHostKind
+): boolean {
+  return hostKind === 'render' && pageLooksRenderWaking(snapshot)
 }
 
 export function pageLooksGoogleTosViolation(snapshot: WebLinkPageSnapshot): boolean {
@@ -372,7 +450,12 @@ export function classifyAnyLinkPage(snapshot: WebLinkPageSnapshot): WebLinkClass
 }
 
 export type UrlLineVerdict = 'valid' | 'error' | 'skipped'
-export type UrlLineErrorCode = WebLinkInactiveReason | 'invalid_url' | 'unreachable' | 'http_error'
+export type UrlLineErrorCode =
+  | WebLinkInactiveReason
+  | 'invalid_url'
+  | 'unreachable'
+  | 'http_error'
+  | 'render_still_waking'
 export type UrlCheckRole = 'form' | 'web'
 export type UrlListCheckTarget = 'all' | UrlCheckRole
 
@@ -382,7 +465,8 @@ export const URL_LINE_ERROR_LABEL: Record<UrlLineErrorCode, string> = {
   google_tos_violation: WEB_LINK_REASON_LABEL.google_tos_violation,
   invalid_url: 'URL không hợp lệ',
   unreachable: 'Không truy cập được (mạng, DNS hoặc hết thời gian chờ)',
-  http_error: 'Máy chủ trả về lỗi HTTP'
+  http_error: 'Máy chủ trả về lỗi HTTP',
+  render_still_waking: 'Server Render vẫn đang thức dậy sau 3 phút chờ'
 }
 
 export interface UrlCheckItem {
@@ -434,6 +518,32 @@ export function looksLikeHttpUrl(value: string): boolean {
   return isPublicHttpUrl(v)
 }
 
+const HTTP_URL_IN_TEXT = /https?:\/\/[^\s<>|"']+/gi
+
+function trimUrlTail(value: string): string {
+  return value.replace(/[),.;:]+$/g, '')
+}
+
+/** Dòng chỉ là tên miền, không có chữ chú thích. `10.30` hay `IT` không tính. */
+function looksLikeBareWebLine(value: string): boolean {
+  const v = (value ?? '').trim()
+  if (!v || /[\s<>|]/.test(v)) return false
+  if (/^https?:\/\//i.test(v)) return looksLikeHttpUrl(v)
+  if (!/^(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/?#][^\s]*)?$/i.test(v)) return false
+  return looksLikeHttpUrl(v)
+}
+
+/** Lấy URL http(s) trong một dòng. Bỏ qua tên, giờ, nhóm và ký tự phân cách. */
+export function findHttpUrlsInText(raw: string): string[] {
+  const line = (raw ?? '').trim()
+  if (!line) return []
+  const found = [...line.matchAll(HTTP_URL_IN_TEXT)].map((match) => trimUrlTail(match[0]))
+  const urls = found.filter((url) => looksLikeHttpUrl(url))
+  if (urls.length) return urls
+  if (looksLikeBareWebLine(line)) return [line]
+  return []
+}
+
 export function inferUrlCheckRole(url: string): UrlCheckRole {
   const u = (url ?? '').toLowerCase()
   if (u.includes('forms.gle') || u.includes('docs.google.com/forms') || u.includes('google.com/forms')) {
@@ -461,8 +571,28 @@ export function extractCheckUrlsFromLine(raw: string): UrlCheckItem[] {
     if (fromParts.length) return fromParts
   }
 
-  if (looksLikeHttpUrl(line)) return [{ url: line, role: inferUrlCheckRole(line) }]
-  return []
+  return findHttpUrlsInText(line).map((url) => ({ url, role: inferUrlCheckRole(url) }))
+}
+
+/** Gỡ các dòng khớp nguyên văn khỏi danh sách. Mỗi lần xuất hiện trong `rawLines` gỡ một dòng. */
+export function omitMatchingRawLines(text: string, rawLines: string[]): { text: string; removed: number } {
+  const pending = new Map<string, number>()
+  for (const raw of rawLines) {
+    if (!raw.trim()) continue
+    pending.set(raw, (pending.get(raw) ?? 0) + 1)
+  }
+  let removed = 0
+  const kept: string[] = []
+  for (const line of (text ?? '').split(/\r?\n/)) {
+    const left = pending.get(line) ?? 0
+    if (left > 0) {
+      pending.set(line, left - 1)
+      removed += 1
+      continue
+    }
+    kept.push(line)
+  }
+  return { text: kept.join('\n'), removed }
 }
 
 export function parseUrlListLines(text: string): UrlListLine[] {
@@ -598,22 +728,11 @@ export function mapUrlListResults(
     const items =
       target === 'all' ? row.urls : row.urls.filter((item) => item.role === target)
     if (items.length === 0) {
-      if (row.urls.length > 0) {
-        return {
-          line: row.line,
-          raw: row.raw,
-          url: row.url,
-          verdict: 'skipped' as const,
-          ...emptyLineFlags()
-        }
-      }
       return {
         line: row.line,
         raw: row.raw,
-        url: row.url,
-        verdict: 'error',
-        errorCode: 'invalid_url',
-        errorLabel: URL_LINE_ERROR_LABEL.invalid_url,
+        url: row.urls.length ? row.url : '',
+        verdict: 'skipped' as const,
         ...emptyLineFlags()
       }
     }

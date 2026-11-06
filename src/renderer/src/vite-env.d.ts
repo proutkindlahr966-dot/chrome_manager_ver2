@@ -24,7 +24,13 @@ import type { ImportGroupsResult } from '@shared/group-import'
 import type { DataImportPreview, DataImportResult } from '@shared/data-import'
 import type { DiskSpaceInfo } from '@shared/disk'
 import type { DbBackupInfo, UpdateCheckResult } from '@shared/app-ops'
-import type { WebLinkCheckProgress, WebLinkCheckResult, UrlListCheckResult } from '@shared/web-link'
+import type {
+  WebLinkCheckProgress,
+  WebLinkCheckResult,
+  WebLinkHostKind,
+  WebLinkKeepAliveStatus,
+  UrlListCheckResult
+} from '@shared/web-link'
 
 export interface AppApi {
   profiles: {
@@ -102,14 +108,29 @@ export interface AppApi {
     restoreNamed: (filePath: string) => Promise<{ profiles: number; groups: number }>
   }
   webLinks: {
-    load: () => Promise<{ content: string; path: string }>
-    save: (content: string) => Promise<{ path: string; count: number }>
+    load: () => Promise<{
+      netlify: { content: string; path: string }
+      render: { content: string; path: string }
+    }>
+    save: (content: string, kind: WebLinkHostKind) => Promise<{ path: string; count: number }>
     check: (content: string, target?: 'web' | 'form') => Promise<WebLinkCheckResult>
-    checkList: (content: string, target?: 'all' | 'web' | 'form') => Promise<UrlListCheckResult>
+    checkList: (
+      content: string,
+      target?: 'all' | 'web' | 'form',
+      hostKind?: WebLinkHostKind
+    ) => Promise<UrlListCheckResult>
     cancel: () => Promise<boolean>
+    setKeepAlive: (input: {
+      hostKind: WebLinkHostKind
+      content: string
+      auto?: boolean
+      intervalMinutes?: number
+    }) => Promise<WebLinkKeepAliveStatus>
+    keepAliveStatus: () => Promise<WebLinkKeepAliveStatus>
     pickFile: () => Promise<string | null>
     exportFile: (content: string) => Promise<string | null>
     onProgress: (cb: (progress: WebLinkCheckProgress) => void) => () => void
+    onKeepAlive: (cb: (status: WebLinkKeepAliveStatus) => void) => () => void
   }
 }
 

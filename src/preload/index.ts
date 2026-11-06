@@ -26,7 +26,13 @@ import type { ImportGroupsResult } from '../shared/group-import'
 import type { DataImportPreview, DataImportResult } from '../shared/data-import'
 import type { DiskSpaceInfo } from '../shared/disk'
 import type { DbBackupInfo, UpdateCheckResult } from '../shared/app-ops'
-import type { WebLinkCheckProgress, WebLinkCheckResult, UrlListCheckResult } from '../shared/web-link'
+import type {
+  WebLinkCheckProgress,
+  WebLinkCheckResult,
+  WebLinkHostKind,
+  WebLinkKeepAliveStatus,
+  UrlListCheckResult
+} from '../shared/web-link'
 
 const api = {
   profiles: {
@@ -150,14 +156,28 @@ const api = {
       ipcRenderer.invoke(IPC.DATA_BACKUP_RESTORE_FILE, filePath)
   },
   webLinks: {
-    load: (): Promise<{ content: string; path: string }> => ipcRenderer.invoke(IPC.WEB_LINKS_LOAD),
-    save: (content: string): Promise<{ path: string; count: number }> =>
-      ipcRenderer.invoke(IPC.WEB_LINKS_SAVE, content),
+    load: (): Promise<{
+      netlify: { content: string; path: string }
+      render: { content: string; path: string }
+    }> => ipcRenderer.invoke(IPC.WEB_LINKS_LOAD),
+    save: (content: string, kind: WebLinkHostKind): Promise<{ path: string; count: number }> =>
+      ipcRenderer.invoke(IPC.WEB_LINKS_SAVE, content, kind),
     check: (content: string, target?: 'web' | 'form'): Promise<WebLinkCheckResult> =>
       ipcRenderer.invoke(IPC.WEB_LINKS_CHECK, content, target),
-    checkList: (content: string, target?: 'all' | 'web' | 'form'): Promise<UrlListCheckResult> =>
-      ipcRenderer.invoke(IPC.WEB_LINKS_CHECK_LIST, content, target),
+    checkList: (
+      content: string,
+      target?: 'all' | 'web' | 'form',
+      hostKind?: WebLinkHostKind
+    ): Promise<UrlListCheckResult> => ipcRenderer.invoke(IPC.WEB_LINKS_CHECK_LIST, content, target, hostKind),
     cancel: (): Promise<boolean> => ipcRenderer.invoke(IPC.WEB_LINKS_CANCEL),
+    setKeepAlive: (input: {
+      hostKind: WebLinkHostKind
+      content: string
+      auto?: boolean
+      intervalMinutes?: number
+    }): Promise<WebLinkKeepAliveStatus> => ipcRenderer.invoke(IPC.WEB_LINKS_KEEPALIVE_SET, input),
+    keepAliveStatus: (): Promise<WebLinkKeepAliveStatus> =>
+      ipcRenderer.invoke(IPC.WEB_LINKS_KEEPALIVE_STATUS),
     pickFile: (): Promise<string | null> => ipcRenderer.invoke(IPC.WEB_LINKS_PICK),
     exportFile: (content: string): Promise<string | null> =>
       ipcRenderer.invoke(IPC.WEB_LINKS_EXPORT, content),
@@ -166,6 +186,12 @@ const api = {
         cb(progress)
       ipcRenderer.on(IPC.WEB_LINKS_PROGRESS, listener)
       return () => ipcRenderer.removeListener(IPC.WEB_LINKS_PROGRESS, listener)
+    },
+    onKeepAlive: (cb: (status: WebLinkKeepAliveStatus) => void): (() => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, status: WebLinkKeepAliveStatus): void =>
+        cb(status)
+      ipcRenderer.on(IPC.WEB_LINKS_KEEPALIVE_EVENT, listener)
+      return () => ipcRenderer.removeListener(IPC.WEB_LINKS_KEEPALIVE_EVENT, listener)
     }
   }
 }

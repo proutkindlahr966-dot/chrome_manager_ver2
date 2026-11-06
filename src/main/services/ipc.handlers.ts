@@ -36,6 +36,11 @@ import { isAllowedImagePath, isPathInside, safeBasename } from '../utils/path-gu
 import { sanitizeDashboardStats } from '../utils/profile-sanitize'
 import { collectProfilesRoots } from '../../shared/profile-roots'
 import { getDataRoot } from '../utils/paths'
+import {
+  getWebLinkKeepAliveStatus,
+  resumeWebLinkKeepAlive,
+  setWebLinkKeepAlive
+} from './web-link-keepalive.service'
 import { readDiskSpace } from '../utils/disk-space'
 import type { DiskSpaceInfo } from '../../shared/disk'
 import { createTimestampedBackup, getBackupDir, listBackups, pruneOldBackups } from '../utils/db-backup'
@@ -592,23 +597,28 @@ ipcMain.handle(IPC.DASHBOARD_STATS, (): DashboardStats => {
   })
 
   ipcMain.handle(IPC.WEB_LINKS_LOAD, async () => {
-    const { loadWebLinks } = await import('./web-link-check.service')
-    return loadWebLinks()
+    const { loadWebLinkLists } = await import('./web-link-check.service')
+    return loadWebLinkLists()
   })
-  ipcMain.handle(IPC.WEB_LINKS_SAVE, async (_e, content: string) => {
+  ipcMain.handle(IPC.WEB_LINKS_SAVE, async (_e, content: string, kind?: 'netlify' | 'render') => {
     const { saveWebLinks } = await import('./web-link-check.service')
-    return saveWebLinks(typeof content === 'string' ? content : '')
+    const hostKind = kind === 'render' ? 'render' : 'netlify'
+    return saveWebLinks(typeof content === 'string' ? content : '', hostKind)
   })
   ipcMain.handle(IPC.WEB_LINKS_CHECK, async (_e, content: string, target?: 'web' | 'form') => {
     const { checkWebLinks } = await import('./web-link-check.service')
     const kind = target === 'form' ? 'form' : 'web'
     return checkWebLinks(typeof content === 'string' ? content : '', kind)
   })
-  ipcMain.handle(IPC.WEB_LINKS_CHECK_LIST, async (_e, content: string, target?: 'all' | 'web' | 'form') => {
-    const { checkUrlList } = await import('./web-link-check.service')
-    const scope = target === 'web' || target === 'form' ? target : 'all'
-    return checkUrlList(typeof content === 'string' ? content : '', scope)
-  })
+  ipcMain.handle(
+    IPC.WEB_LINKS_CHECK_LIST,
+    async (_e, content: string, target?: 'all' | 'web' | 'form', hostKind?: 'netlify' | 'render') => {
+      const { checkUrlList } = await import('./web-link-check.service')
+      const scope = target === 'web' || target === 'form' ? target : 'all'
+      const kind = hostKind === 'render' ? 'render' : 'netlify'
+      return checkUrlList(typeof content === 'string' ? content : '', scope, kind)
+    }
+  )
   ipcMain.handle(IPC.WEB_LINKS_CANCEL, async () => {
     const { cancelWebLinkCheck } = await import('./web-link-check.service')
     cancelWebLinkCheck()
@@ -657,4 +667,23 @@ ipcMain.handle(IPC.DASHBOARD_STATS, (): DashboardStats => {
     writeFileSync(result.filePath, typeof content === 'string' ? content : '', 'utf8')
     return result.filePath
   })
+  ipcMain.handle(
+    IPC.WEB_LINKS_KEEPALIVE_SET,
+    (
+      _e,
+      input?: { hostKind?: 'netlify' | 'render'; content?: string; auto?: boolean; intervalMinutes?: number }
+    ) => {
+      const hostKind = input?.hostKind === 'render' ? 'render' : input?.hostKind === 'netlify' ? 'netlify' : undefined
+      const content = typeof input?.content === 'string' ? input.content : undefined
+      const auto = typeof input?.auto === 'boolean' ? input.auto : undefined
+      const intervalMinutes =
+        typeof input?.intervalMinutes === 'number' && Number.isFinite(input.intervalMinutes)
+          ? input.intervalMinutes
+          : undefined
+      return setWebLinkKeepAlive({ hostKind, content, auto, intervalMinutes })
+    }
+  )
+  ipcMain.handle(IPC.WEB_LINKS_KEEPALIVE_STATUS, () => getWebLinkKeepAliveStatus())
+
+  resumeWebLinkKeepAlive()
 }
