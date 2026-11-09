@@ -219,6 +219,42 @@ describe('web-link classify', () => {
     expect(result).toEqual({ verdict: 'active', reason: null })
   })
 
+  it('Render Service Suspended là lỗi, không phải server đang thức dậy', () => {
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Service Suspended</title>
+</head>
+<body>
+This service has been suspended by its owner.
+</body>
+</html>`
+    const snapshot = {
+      finalUrl: 'https://bluecheck-accountverification.onrender.com/recaptcha',
+      statusCode: 503,
+      title: 'Service Suspended',
+      bodyText: 'This service has been suspended by its owner.',
+      html
+    }
+    expect(pageLooksRenderWaking(snapshot)).toBe(false)
+    expect(shouldWaitForRenderWake(snapshot, 'render')).toBe(false)
+    expect(classifyWebLinkPage(snapshot)).toEqual({ verdict: 'inactive', reason: 'render_suspended' })
+    expect(classifySnapshotToProbe(snapshot, 'web').errorCode).toBe('render_suspended')
+  })
+
+  it('câu bảo vệ nâng cao trên trang thường không phải cảnh báo trình duyệt', () => {
+    const result = classifyWebLinkPage({
+      finalUrl: 'https://contentstandardsreview.onrender.com/help',
+      statusCode: 200,
+      title: 'Meta | Community Standards Violation',
+      bodyText: 'Chúng tôi đã kích hoạt các biện pháp bảo vệ nâng cao để bỏ chặn Trang của bạn.',
+      html: '<p>Chúng tôi đã kích hoạt các biện pháp bảo vệ nâng cao để bỏ chặn Trang của bạn.</p>'
+    })
+    expect(result).toEqual({ verdict: 'active', reason: null })
+  })
+
   it('nhận màn hình Render đang thức dậy và bỏ qua khi loại Netlify', () => {
     const waking = {
       finalUrl: 'https://bluebadge-ownershipvalidation.onrender.com/recaptcha',

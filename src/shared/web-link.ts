@@ -25,12 +25,17 @@ export function clampRenderKeepAliveMinutes(value: number): number {
 
 export type WebLinkCheckTarget = 'web' | 'form'
 export type WebLinkUrlField = 'linkWeb' | 'linkForm'
-export type WebLinkInactiveReason = 'netlify_not_found' | 'dangerous_site' | 'google_tos_violation'
+export type WebLinkInactiveReason =
+  | 'netlify_not_found'
+  | 'dangerous_site'
+  | 'google_tos_violation'
+  | 'render_suspended'
 
 export const WEB_LINK_REASON_LABEL: Record<WebLinkInactiveReason, string> = {
   netlify_not_found: 'Site not found (Netlify) — site đã gỡ hoặc sai URL',
   dangerous_site: 'Trang web nguy hiểm — trình duyệt chặn truy cập',
-  google_tos_violation: 'Link_form vi phạm Điều khoản Google Drive/Form — không truy cập được'
+  google_tos_violation: 'Link_form vi phạm Điều khoản Google Drive/Form — không truy cập được',
+  render_suspended: 'Service Suspended — chủ sở hữu đã tạm ngưng dịch vụ Render'
 }
 
 export interface WebLinkRow {
@@ -265,8 +270,6 @@ export function pageLooksDangerous(snapshot: WebLinkPageSnapshot): boolean {
   if (blob.includes('safebrowsing-interstitial')) return true
   if (blob.includes('trang web nguy hiểm') || blob.includes('trang web nguy hiem')) return true
   if (blob.includes('quay lại trang an toàn') || blob.includes('quay lai trang an toan')) return true
-  if (blob.includes('bảo vệ tăng cường') || blob.includes('bao ve tang cuong')) return true
-  if (blob.includes('bảo vệ nâng cao') || blob.includes('bao ve nang cao')) return true
   if (blob.includes('lừa bạn cài đặt phần mềm') || blob.includes('lua ban cai dat phan mem')) return true
   if (blob.includes('deceptive site ahead')) return true
   if (/\bdangerous site\b/.test(blob)) return true
@@ -311,8 +314,18 @@ export function isRenderHost(raw: string): boolean {
   }
 }
 
+/** Render trả trang này khi chủ dịch vụ đã tạm ngưng, thường kèm HTTP 503. */
+export function pageLooksRenderSuspended(snapshot: WebLinkPageSnapshot): boolean {
+  const blob = [snapshot.title, snapshot.bodyText, snapshot.html].join('\n').toLowerCase()
+  if (blob.includes('this service has been suspended by its owner')) return true
+  if (blob.includes('service has been suspended')) return true
+  if (isRenderHost(snapshot.finalUrl) && blob.includes('service suspended')) return true
+  return false
+}
+
 /** Trang chờ của Render khi instance miễn phí đang thức dậy (ảnh splash tối, Application loading). */
 export function pageLooksRenderWaking(snapshot: WebLinkPageSnapshot): boolean {
+  if (pageLooksRenderSuspended(snapshot)) return false
   const blob = [snapshot.finalUrl, snapshot.title, snapshot.bodyText, snapshot.html]
     .join('\n')
     .toLowerCase()
@@ -369,6 +382,9 @@ export function pageLooksGoogleTosViolation(snapshot: WebLinkPageSnapshot): bool
 export function classifyWebLinkPage(snapshot: WebLinkPageSnapshot): WebLinkClassification {
   if (pageLooksDangerous(snapshot)) {
     return { verdict: 'inactive', reason: 'dangerous_site' }
+  }
+  if (pageLooksRenderSuspended(snapshot)) {
+    return { verdict: 'inactive', reason: 'render_suspended' }
   }
   if (pageLooksNetlifyMissing(snapshot)) {
     return { verdict: 'inactive', reason: 'netlify_not_found' }
@@ -463,6 +479,7 @@ export const URL_LINE_ERROR_LABEL: Record<UrlLineErrorCode, string> = {
   netlify_not_found: WEB_LINK_REASON_LABEL.netlify_not_found,
   dangerous_site: WEB_LINK_REASON_LABEL.dangerous_site,
   google_tos_violation: WEB_LINK_REASON_LABEL.google_tos_violation,
+  render_suspended: WEB_LINK_REASON_LABEL.render_suspended,
   invalid_url: 'URL không hợp lệ',
   unreachable: 'Không truy cập được (mạng, DNS hoặc hết thời gian chờ)',
   http_error: 'Máy chủ trả về lỗi HTTP',

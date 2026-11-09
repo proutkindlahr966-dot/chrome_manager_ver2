@@ -512,7 +512,12 @@ function pickAnySnapshot(
 }
 
 function knownInactiveReason(code?: UrlProbeVerdict['errorCode']): WebLinkInactiveReason | null {
-  if (code === 'netlify_not_found' || code === 'dangerous_site' || code === 'google_tos_violation') {
+  if (
+    code === 'netlify_not_found' ||
+    code === 'dangerous_site' ||
+    code === 'google_tos_violation' ||
+    code === 'render_suspended'
+  ) {
     return code
   }
   return null
