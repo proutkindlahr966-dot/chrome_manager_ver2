@@ -31,6 +31,7 @@ Cách dùng hàng ngày trên Windows: double-click **`Chrome Manager.lnk`** ở
 - Tạo / tạo lại shortcut: `scripts\create-shortcut.bat`
 - Launcher ẩn CMD: `scripts\start-silent.vbs`
 - Launcher có log: `scripts\start.bat`
+- Cài mới hoàn toàn (xoá data, `node_modules`, build lại): `scripts\install-fresh.bat`
 
 Hoặc bằng terminal:
 

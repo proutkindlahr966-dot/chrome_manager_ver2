@@ -109,25 +109,36 @@ function errorTags(row: UrlLineResult): string {
 function OutputLine({ row }: { row: UrlLineResult }): JSX.Element {
   const parts = row.raw.split('|')
   const pipe = parts.length >= 3
-  const tags = row.verdict === 'error' ? errorTags(row) : ''
-  const reason = row.verdict === 'error' ? row.errorLabel : ''
+  const warn = row.verdict === 'warning'
+  const tags = row.verdict === 'error' ? errorTags(row) : warn ? 'Cảnh báo' : ''
+  const reason = row.verdict === 'error' || warn ? row.errorLabel : ''
 
   return (
     <div className={cn('whitespace-pre-wrap break-all', row.verdict === 'skipped' && 'text-ink-muted')}>
       {pipe
         ? parts.map((part, index) => {
             const bad = (index === 0 && row.formError) || (index === 2 && row.webError)
+            const warnWeb = warn && index === 2
             return (
               <span key={index}>
                 {index > 0 ? '|' : ''}
-                <span className={cn(bad && 'text-danger')}>{part}</span>
+                <span className={cn(bad && 'text-danger', warnWeb && 'text-warning')}>{part}</span>
               </span>
             )
           })
         : (
-            <span className={cn(row.verdict === 'error' && 'text-danger')}>{row.raw || ' '}</span>
+            <span
+              className={cn(
+                row.verdict === 'error' && 'text-danger',
+                warn && 'text-warning'
+              )}
+            >
+              {row.raw || ' '}
+            </span>
           )}
-      {tags ? <span className="text-danger"> [{tags}]</span> : null}
+      {tags ? (
+        <span className={cn(warn ? 'text-warning' : 'text-danger')}> [{tags}]</span>
+      ) : null}
       {reason ? <span className="text-ink-muted"> ({reason})</span> : null}
     </div>
   )
@@ -465,6 +476,7 @@ export function WebLinksPage(): JSX.Element {
         const bits: string[] = []
         if (next.formError) bits.push(`${next.formError} Link_form`)
         if (next.webError) bits.push(`${next.webError} Link_web`)
+        if (next.warning) bits.push(`${next.warning} cảnh báo HTTP 502`)
         if (removedDangerous > 0) {
           bits.push(`đã gỡ ${removedDangerous} dòng trang nguy hiểm khỏi danh sách`)
         }
@@ -472,6 +484,12 @@ export function WebLinksPage(): JSX.Element {
           tone: 'error',
           title: `${next.error} dòng lỗi`,
           description: bits.length ? bits.join(' · ') : 'Xem Output bên phải.'
+        })
+      } else if (next.warning > 0) {
+        toast({
+          tone: 'warning',
+          title: `${next.warning} dòng cần làm mới lại`,
+          description: 'HTTP 502 — giữ nguyên trong danh sách, kiểm tra lại lần sau.'
         })
       } else {
         toast({
@@ -539,6 +557,17 @@ export function WebLinksPage(): JSX.Element {
                 )}
               >
                 {listResult?.webError ?? '—'}
+              </div>
+            </div>
+            <div className="rounded-xl border border-line bg-surface-muted/50 px-3 py-2">
+              <div className="text-2xs uppercase tracking-wide text-ink-muted">Cảnh báo</div>
+              <div
+                className={cn(
+                  'font-display text-lg font-semibold tabular-nums',
+                  (listResult?.warning ?? 0) > 0 ? 'text-warning' : 'text-ink'
+                )}
+              >
+                {listResult?.warning ?? '—'}
               </div>
             </div>
           </div>
@@ -657,7 +686,7 @@ export function WebLinksPage(): JSX.Element {
                       ? `Đang làm mới ${keepAlive.urlCount} Link_web.`
                       : `Tự vào ${keepAlive.urlCount} Link_web mỗi ${refreshMinutes} phút.${
                           keepAlive.nextRunAt ? ` Lần tới ${formatRefreshTime(keepAlive.nextRunAt)}.` : ''
-                        } Link dính «Trang web nguy hiểm» được gỡ khỏi danh sách và đưa vào Output Render.`
+                        } Link dính «Trang web nguy hiểm» được gỡ khỏi danh sách và đưa vào Output Render. Đóng ứng dụng thì lịch này vẫn chạy ẩn; mở lại từ biểu tượng cạnh đồng hồ.`
                     : 'Bật rồi. Thêm Link_web để bắt đầu làm mới.'
                   : `Bấm nút để tự vào Link_web. Server miễn phí ngủ sau khoảng 15 phút, nên chu kỳ từ ${RENDER_KEEPALIVE_MIN_MINUTES} đến ${RENDER_KEEPALIVE_MAX_MINUTES} phút.`}
               </p>
@@ -742,7 +771,7 @@ export function WebLinksPage(): JSX.Element {
             ) : null}
           </div>
           <p className="text-xs leading-relaxed text-ink-muted">
-            Mỗi dòng một kết quả, sát nhau như danh sách. URL lỗi màu đỏ, lý do nằm cuối dòng.
+            Mỗi dòng một kết quả, sát nhau như danh sách. URL lỗi màu đỏ, HTTP 502 màu vàng (cảnh báo, không xóa dòng), lý do nằm cuối dòng.
             {hostKind === 'render'
               ? ' Khi kiểm tra hoặc làm mới, dòng trang nguy hiểm được gỡ khỏi danh sách và hiện ở đây.'
               : ''}

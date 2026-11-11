@@ -2,6 +2,20 @@ export const WEB_LINK_HEADER = 'Link_form|Nhóm|Link_web|Status_link'
 export const WEB_LINK_STATUS_ACTIVE = 'Hoạt động'
 export const WEB_LINK_STATUS_INACTIVE = 'Không hoạt động'
 export const WEB_LINKS_MAX_UNIQUE = 400
+/** Trên 30 Link_web: 2 cửa sổ Chrome; còn lại: 1 cửa sổ. Mỗi cửa sổ 10 tab. */
+export const CHROME_CHECK_TABS_PER_WINDOW = 10
+export const CHROME_CHECK_TWO_WINDOW_AFTER = 30
+
+export function chromeLayoutForLinkWeb(webLinkCount: number): {
+  windows: number
+  tabsPerWindow: number
+} {
+  if (webLinkCount <= 0) return { windows: 0, tabsPerWindow: 0 }
+  return {
+    windows: webLinkCount > CHROME_CHECK_TWO_WINDOW_AFTER ? 2 : 1,
+    tabsPerWindow: CHROME_CHECK_TABS_PER_WINDOW
+  }
+}
 
 /** Loại máy chủ của Link_web. Render miễn phí ngủ sau khoảng 15 phút không có request. */
 export type WebLinkHostKind = 'netlify' | 'render'
@@ -323,9 +337,15 @@ export function pageLooksRenderSuspended(snapshot: WebLinkPageSnapshot): boolean
   return false
 }
 
-/** Trang chờ của Render khi instance miễn phí đang thức dậy (ảnh splash tối, Application loading). */
+/** HTTP 502: cảnh báo làm mới lần sau, không chờ thức dậy và không xóa dòng. */
+export function isRenderHttp502(snapshot: WebLinkPageSnapshot): boolean {
+  return snapshot.statusCode === 502
+}
+
+/** Trang chờ của Render khi instance miễn phí đang thức dậy (ảnh splash tối, HTTP 503). */
 export function pageLooksRenderWaking(snapshot: WebLinkPageSnapshot): boolean {
   if (pageLooksRenderSuspended(snapshot)) return false
+  if (isRenderHttp502(snapshot)) return false
   const blob = [snapshot.finalUrl, snapshot.title, snapshot.bodyText, snapshot.html]
     .join('\n')
     .toLowerCase()
@@ -339,8 +359,7 @@ export function pageLooksRenderWaking(snapshot: WebLinkPageSnapshot): boolean {
 
   const onRender = isRenderHost(snapshot.finalUrl) || blob.includes('.onrender.com')
   if (!onRender) return false
-  if (snapshot.statusCode === 502 || snapshot.statusCode === 503) return true
-  if (blob.includes('bad gateway')) return true
+  if (snapshot.statusCode === 503) return true
   if (blob.includes('no available server')) return true
   return false
 }
@@ -465,12 +484,13 @@ export function classifyAnyLinkPage(snapshot: WebLinkPageSnapshot): WebLinkClass
   return classifyWebLinkPage(snapshot)
 }
 
-export type UrlLineVerdict = 'valid' | 'error' | 'skipped'
+export type UrlLineVerdict = 'valid' | 'error' | 'warning' | 'skipped'
 export type UrlLineErrorCode =
   | WebLinkInactiveReason
   | 'invalid_url'
   | 'unreachable'
   | 'http_error'
+  | 'http_502'
   | 'render_still_waking'
 export type UrlCheckRole = 'form' | 'web'
 export type UrlListCheckTarget = 'all' | UrlCheckRole
@@ -483,6 +503,7 @@ export const URL_LINE_ERROR_LABEL: Record<UrlLineErrorCode, string> = {
   invalid_url: 'URL không hợp lệ',
   unreachable: 'Không truy cập được (mạng, DNS hoặc hết thời gian chờ)',
   http_error: 'Máy chủ trả về lỗi HTTP',
+  http_502: 'Máy chủ trả về HTTP 502 — làm mới lại lần sau',
   render_still_waking: 'Server Render vẫn đang thức dậy sau 3 phút chờ'
 }
 
@@ -515,6 +536,7 @@ export interface UrlListCheckResult {
   valid: number
   error: number
   skipped: number
+  warning: number
   formError: number
   webError: number
   uniqueChecked: number
@@ -523,7 +545,7 @@ export interface UrlListCheckResult {
 }
 
 export interface UrlProbeVerdict {
-  verdict: 'valid' | 'error'
+  verdict: 'valid' | 'error' | 'warning'
   errorCode?: UrlLineErrorCode
   errorLabel?: string
 }
@@ -686,6 +708,13 @@ export function classifySnapshotToProbe(
       errorLabel: WEB_LINK_REASON_LABEL[hit.reason]
     }
   }
+  if (snapshot.statusCode === 502) {
+    return {
+      verdict: 'warning',
+      errorCode: 'http_502',
+      errorLabel: URL_LINE_ERROR_LABEL.http_502
+    }
+  }
   // 400/401/403 thường do chặn bot, không đủ để kết luận link chết.
   if (snapshot.statusCode === 404 || snapshot.statusCode === 410 || snapshot.statusCode >= 500) {
     return {
@@ -754,6 +783,7 @@ export function mapUrlListResults(
       }
     }
     let firstError: UrlProbeVerdict | null = null
+    let firstWarning: UrlProbeVerdict | null = null
     let formError = false
     let webError = false
     let sawUnchecked = false
@@ -763,12 +793,15 @@ export function mapUrlListResults(
         sawUnchecked = true
         continue
       }
-      if (hit.verdict !== 'error') continue
-      if (!firstError) firstError = hit
-      if (item.role === 'form') formError = true
-      if (item.role === 'web') webError = true
+      if (hit.verdict === 'error') {
+        if (!firstError) firstError = hit
+        if (item.role === 'form') formError = true
+        if (item.role === 'web') webError = true
+        continue
+      }
+      if (hit.verdict === 'warning' && !firstWarning) firstWarning = hit
     }
-    if (!firstError && sawUnchecked) {
+    if (!firstError && !firstWarning && sawUnchecked) {
       return {
         line: row.line,
         raw: row.raw,
@@ -789,6 +822,17 @@ export function mapUrlListResults(
         webError
       }
     }
+    if (firstWarning) {
+      return {
+        line: row.line,
+        raw: row.raw,
+        url: row.url,
+        verdict: 'warning',
+        errorCode: firstWarning.errorCode,
+        errorLabel: firstWarning.errorLabel ?? URL_LINE_ERROR_LABEL.http_502,
+        ...emptyLineFlags()
+      }
+    }
     return {
       line: row.line,
       raw: row.raw,
@@ -801,18 +845,20 @@ export function mapUrlListResults(
 
 export function summarizeUrlList(
   lines: UrlLineResult[]
-): Pick<UrlListCheckResult, 'valid' | 'error' | 'skipped' | 'formError' | 'webError'> {
+): Pick<UrlListCheckResult, 'valid' | 'error' | 'skipped' | 'warning' | 'formError' | 'webError'> {
   let valid = 0
   let error = 0
   let skipped = 0
+  let warning = 0
   let formError = 0
   let webError = 0
   for (const row of lines) {
     if (row.verdict === 'valid') valid += 1
     else if (row.verdict === 'error') error += 1
+    else if (row.verdict === 'warning') warning += 1
     else skipped += 1
     if (row.formError) formError += 1
     if (row.webError) webError += 1
   }
-  return { valid, error, skipped, formError, webError }
+  return { valid, error, skipped, warning, formError, webError }
 }

@@ -25,6 +25,7 @@ import {
 } from '@shared/disk'
 import { cn, formatDate } from '@/lib/utils'
 import type { DbBackupInfo, UpdateCheckResult } from '@shared/app-ops'
+import type { AppWipePlan } from '@shared/app-wipe'
 
 function omitWindowState(value: AppSettings): Omit<AppSettings, 'windowState'> {
   const { windowState: _windowState, ...rest } = value
@@ -62,6 +63,8 @@ export function SettingsPage(): JSX.Element {
   const [diskByPath, setDiskByPath] = useState<Record<string, DiskSpaceInfo>>({})
   const [backups, setBackups] = useState<DbBackupInfo[]>([])
   const [updateNote, setUpdateNote] = useState<string>('')
+  const [wipePlan, setWipePlan] = useState<AppWipePlan | null>(null)
+  const [wiping, setWiping] = useState(false)
 
   useEffect(() => {
     if (settings) setForm(settings)
@@ -76,6 +79,7 @@ export function SettingsPage(): JSX.Element {
       })
       .catch(() => undefined)
     void window.api.backup.list().then(setBackups).catch(() => undefined)
+    void window.api.app.wipePreview().then(setWipePlan).catch(() => undefined)
   }, [])
 
   async function onSubmit(e: FormEvent): Promise<void> {
@@ -241,6 +245,50 @@ export function SettingsPage(): JSX.Element {
       toast({
         tone: 'error',
         title: 'Không khôi phục được',
+        description: error instanceof Error ? error.message : undefined
+      })
+    }
+  }
+
+  async function wipeApp(): Promise<void> {
+    let plan = wipePlan
+    try {
+      plan = await window.api.app.wipePreview()
+      setWipePlan(plan)
+    } catch (error) {
+      toast({
+        tone: 'error',
+        title: 'Không liệt kê được thư mục',
+        description: error instanceof Error ? error.message : undefined
+      })
+      return
+    }
+    const targets = [...plan.folders, ...plan.files]
+    if (targets.length === 0) {
+      toast({ tone: 'warning', title: 'Không có dữ liệu để xoá' })
+      return
+    }
+    const preview = targets.slice(0, 12).join('\n')
+    const more = targets.length > 12 ? `\n… và ${targets.length - 12} mục nữa` : ''
+    const ok = await askConfirm({
+      title: 'Xoá ứng dụng?',
+      description: `Xoá sạch các thư mục bên dưới, gỡ shortcut, đóng Chrome do app mở rồi thoát. Không khôi phục được.\n\n${preview}${more}`,
+      confirmLabel: 'Xoá sạch',
+      danger: true
+    })
+    if (!ok) return
+    setWiping(true)
+    try {
+      const result = await window.api.app.wipe()
+      if (!result.ok) {
+        setWiping(false)
+        toast({ tone: 'error', title: 'Không xoá được', description: result.error })
+      }
+    } catch (error) {
+      setWiping(false)
+      toast({
+        tone: 'error',
+        title: 'Không xoá được',
         description: error instanceof Error ? error.message : undefined
       })
     }
@@ -680,6 +728,47 @@ export function SettingsPage(): JSX.Element {
           </button>
         </div>
       </form>
+
+      <section className="mt-5 rounded-xl border border-danger/40 bg-danger/5 p-4 text-sm">
+        <div className="flex items-center gap-2 font-medium text-danger">
+          <Trash2 size={15} />
+          Xoá ứng dụng
+        </div>
+        <p className="mt-1 text-xs text-ink-muted">
+          Xoá sạch dữ liệu app: thư mục hồ sơ, file Gmail, bản sao lưu, dữ liệu trong AppData,
+          shortcut và bản đã cài. Mã nguồn trong thư mục dự án được giữ. Muốn cài lại từ đầu
+          (kể cả node_modules), chạy <span className="font-mono">scripts\install-fresh.bat</span>.
+        </p>
+        {wipePlan ? (
+          <ul className="mt-3 max-h-40 space-y-1 overflow-auto text-xs">
+            {[...wipePlan.folders, ...wipePlan.files].map((item) => (
+              <li key={item} className="truncate font-mono text-ink-soft" title={item}>
+                {item}
+              </li>
+            ))}
+            {wipePlan.folders.length + wipePlan.files.length === 0 ? (
+              <li className="text-ink-muted">Không thấy thư mục dữ liệu để xoá.</li>
+            ) : null}
+          </ul>
+        ) : (
+          <p className="mt-3 text-xs text-ink-muted">Đang liệt kê thư mục…</p>
+        )}
+        {wipePlan && wipePlan.skipped.length > 0 ? (
+          <p className="mt-2 text-[11px] text-ink-muted">
+            Giữ lại {wipePlan.skipped.length} đường dẫn quá rộng hoặc thuộc mã nguồn, ví dụ{' '}
+            <span className="font-mono">{wipePlan.skipped[0]?.path}</span>.
+          </p>
+        ) : null}
+        <button
+          type="button"
+          className="btn-danger mt-3"
+          disabled={wiping}
+          onClick={() => void wipeApp()}
+        >
+          <Trash2 size={14} />
+          {wiping ? 'Đang xoá...' : 'Xoá ứng dụng'}
+        </button>
+      </section>
     </div>
   )
 }

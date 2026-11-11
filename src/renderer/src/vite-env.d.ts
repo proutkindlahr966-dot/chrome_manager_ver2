@@ -24,6 +24,7 @@ import type { ImportGroupsResult } from '@shared/group-import'
 import type { DataImportPreview, DataImportResult } from '@shared/data-import'
 import type { DiskSpaceInfo } from '@shared/disk'
 import type { DbBackupInfo, UpdateCheckResult } from '@shared/app-ops'
+import type { AppWipePlan } from '@shared/app-wipe'
 import type {
   WebLinkCheckProgress,
   WebLinkCheckResult,
@@ -100,6 +101,8 @@ export interface AppApi {
     info: () => Promise<{ name: string; version: string; packaged: boolean; backupDir: string }>
     checkUpdates: (feedUrl?: string) => Promise<UpdateCheckResult>
     installUpdate: (feedUrl?: string) => Promise<{ ok: true } | { ok: false; error: string }>
+    wipePreview: () => Promise<AppWipePlan>
+    wipe: () => Promise<{ ok: true } | { ok: false; error: string }>
   }
   backup: {
     list: () => Promise<DbBackupInfo[]>

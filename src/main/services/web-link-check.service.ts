@@ -32,6 +32,7 @@ import {
   WEB_LINK_STATUS_ACTIVE,
   WEB_LINK_STATUS_INACTIVE,
   WEB_LINKS_MAX_UNIQUE,
+  chromeLayoutForLinkWeb,
   type UrlCheckRole,
   type UrlLineResult,
   type UrlListCheckResult,
@@ -50,8 +51,6 @@ import {
 const FETCH_TIMEOUT_MS = 12_000
 const PAGE_TIMEOUT_MS = 16_000
 const HTTP_CONCURRENCY = 4
-/** Số tab Chrome mở cùng lúc khi kiểm tra Link_web. */
-const CHROME_WEB_TAB_CONCURRENCY = 6
 const MAX_REDIRECTS = 6
 const MAX_BODY = 400_000
 
@@ -224,6 +223,7 @@ async function mapPool<T, R>(items: T[], limit: number, worker: (item: T, index:
 
 type BrowserLike = {
   newPage: () => Promise<PageLike>
+  pages: () => Promise<PageLike[]>
   close: () => Promise<void>
 }
 
@@ -289,24 +289,49 @@ function seedSafeBrowsingStores(userDataDir: string): void {
   }
 }
 
-async function launchChecker(chromePath: string, userDataDir: string): Promise<BrowserLike> {
+async function closeExtraCheckerPages(browser: BrowserLike, keep: Set<PageLike>): Promise<void> {
+  const extras = (await browser.pages()).filter((page) => !keep.has(page))
+  await Promise.all(extras.map((page) => page.close().catch(() => undefined)))
+}
+
+async function openCheckerPages(browser: BrowserLike, count: number): Promise<PageLike[]> {
+  const pages: PageLike[] = []
+  for (let i = 0; i < count; i += 1) {
+    const page = await browser.newPage()
+    await page.setUserAgent(DEFAULT_USER_AGENT)
+    pages.push(page)
+  }
+  const keep = new Set(pages)
+  await closeExtraCheckerPages(browser, keep)
+  await sleep(200)
+  await closeExtraCheckerPages(browser, keep)
+  return pages
+}
+
+async function launchChecker(
+  chromePath: string,
+  userDataDir: string,
+  windowIndex = 0
+): Promise<BrowserLike> {
   mkdirSync(userDataDir, { recursive: true })
   seedSafeBrowsingStores(userDataDir)
   const puppeteer = (await import('puppeteer-core')).default
+  const shift = windowIndex * 48
   const browser = await puppeteer.launch({
     executablePath: chromePath,
     headless: false,
     defaultViewport: { width: 1100, height: 720 },
     ignoreDefaultArgs: SAFE_BROWSING_RESTORE_ARGS,
     args: [
-      '--window-position=-2800,-2800',
+      `--window-position=${-2800 + shift},${-2800 + shift}`,
       '--window-size=1100,720',
       `--user-data-dir=${userDataDir}`,
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-sync',
       '--disable-popup-blocking',
-      '--disable-features=Translate,MediaRouter',
+      '--disable-session-crashed-bubble',
+      '--disable-features=Translate,MediaRouter,ChromeWhatsNew',
       '--lang=vi-VN'
     ]
   })
@@ -314,21 +339,102 @@ async function launchChecker(chromePath: string, userDataDir: string): Promise<B
   return browser as unknown as BrowserLike
 }
 
-async function openCheckerBrowser(chromePath: string): Promise<BrowserLike> {
+async function openOneCheckerBrowser(chromePath: string, windowIndex: number): Promise<BrowserLike> {
   const dir = getWebLinkCheckProfileDir()
+  const profileDir = windowIndex === 0 ? dir : `${dir}-w${windowIndex}`
   try {
-    return await launchChecker(chromePath, dir)
+    return await launchChecker(chromePath, profileDir, windowIndex)
   } catch (error) {
-    console.error('[web-link] Chrome profile chính bận, thử thư mục tạm', error)
-    return launchChecker(chromePath, `${dir}-${Date.now()}`)
+    console.error('[web-link] Chrome profile bận, thử thư mục tạm', error)
+    return launchChecker(chromePath, `${profileDir}-${Date.now()}`, windowIndex)
   }
+}
+
+async function openCheckerBrowsers(chromePath: string, count: number): Promise<BrowserLike[]> {
+  const n = Math.max(1, count)
+  const settled = await Promise.allSettled(
+    Array.from({ length: n }, (_, i) => openOneCheckerBrowser(chromePath, i))
+  )
+  const browsers: BrowserLike[] = []
+  for (const item of settled) {
+    if (item.status === 'fulfilled') browsers.push(item.value)
+    else console.error('[web-link] Không mở được Chrome kiểm tra', item.reason)
+  }
+  return browsers
+}
+
+async function closeCheckerBrowsers(browsers: BrowserLike[]): Promise<void> {
+  await Promise.all(browsers.map((browser) => browser.close().catch(() => undefined)))
+}
+
+async function launchCheckerPool(
+  chromePath: string,
+  windows: number,
+  tabsPerWindow: number
+): Promise<{ browsers: BrowserLike[]; pages: PageLike[] }> {
+  if (!chromePath || windows <= 0) return { browsers: [], pages: [] }
+  const browsers = await openCheckerBrowsers(chromePath, windows)
+  const pages: PageLike[] = []
+  try {
+    const tabs = Math.max(0, tabsPerWindow)
+    if (tabs > 0) {
+      for (const browser of browsers) {
+        pages.push(...(await openCheckerPages(browser, tabs)))
+      }
+    }
+    return { browsers, pages }
+  } catch (error) {
+    await closeCheckerPages(pages)
+    await closeCheckerBrowsers(browsers)
+    throw error
+  }
+}
+
+async function closeCheckerPages(pages: PageLike[]): Promise<void> {
+  await Promise.all(pages.map((page) => page.close().catch(() => undefined)))
+}
+
+async function runChromeWebPool(
+  pages: PageLike[],
+  urls: string[],
+  worker: (page: PageLike | null, url: string) => Promise<void>
+): Promise<void> {
+  if (urls.length === 0) return
+  if (pages.length === 0) {
+    for (const url of urls) {
+      if (cancelled) break
+      await worker(null, url)
+    }
+    return
+  }
+  let next = 0
+  async function run(page: PageLike): Promise<void> {
+    while (!cancelled) {
+      const index = next
+      next += 1
+      if (index >= urls.length) return
+      await worker(page, urls[index])
+    }
+  }
+  await Promise.all(pages.map((page) => run(page)))
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function readCheckerPage(page: PageLike): Promise<WebLinkPageSnapshot> {
+function httpResponseStatus(response: unknown): number | undefined {
+  if (!response || typeof response !== 'object' || !('status' in response)) return undefined
+  const status = (response as { status: unknown }).status
+  if (typeof status !== 'function') return undefined
+  const code = status.call(response)
+  return typeof code === 'number' ? code : undefined
+}
+
+async function readCheckerPage(
+  page: PageLike,
+  statusCode = 200
+): Promise<WebLinkPageSnapshot> {
   const info = await page.evaluate(() => ({
     url: location.href,
     title: document.title || '',
@@ -337,7 +443,7 @@ async function readCheckerPage(page: PageLike): Promise<WebLinkPageSnapshot> {
   }))
   return {
     finalUrl: info.url || page.url(),
-    statusCode: 200,
+    statusCode,
     title: info.title,
     bodyText: info.bodyText,
     html: info.html
@@ -362,12 +468,16 @@ function blockedNavigationSnapshot(message: string): WebLinkPageSnapshot | null 
   }
 }
 
-async function readVisibleOrBlocked(page: PageLike, message = ''): Promise<WebLinkPageSnapshot | null> {
+async function readVisibleOrBlocked(
+  page: PageLike,
+  message = '',
+  statusCode = 200
+): Promise<WebLinkPageSnapshot | null> {
   if (/err_blocked_by_client|err_blocked_by_administrator/i.test(message)) {
     await sleep(800)
   }
   try {
-    const snapshot = await readCheckerPage(page)
+    const snapshot = await readCheckerPage(page, statusCode)
     if (pageLooksDangerous(snapshot)) return snapshot
   } catch {
     // Trang lỗi của Chrome đôi khi chưa đọc được ngay sau khi điều hướng bị chặn.
@@ -396,14 +506,15 @@ async function probeChromeOnce(
   url: string
 ): Promise<{ snapshot?: WebLinkPageSnapshot; error?: string }> {
   try {
-    await page.goto(ensureHttpUrl(url), {
+    const response = await page.goto(ensureHttpUrl(url), {
       waitUntil: 'domcontentloaded',
       timeout: PAGE_TIMEOUT_MS
     })
     await sleep(900)
-    const blocked = await readVisibleOrBlocked(page)
+    const statusCode = httpResponseStatus(response) ?? 200
+    const blocked = await readVisibleOrBlocked(page, '', statusCode)
     if (blocked && pageLooksDangerous(blocked)) return { snapshot: blocked }
-    return { snapshot: await readCheckerPage(page) }
+    return { snapshot: await readCheckerPage(page, statusCode) }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Chrome không mở được trang'
     const blocked = await readVisibleOrBlocked(page, message)
@@ -427,12 +538,12 @@ async function probeChromeUntilRenderReady(
     const reload = polls === 0 || polls % 4 === 0 || !snapshot
     if (reload) {
       try {
-        await page.goto(ensureHttpUrl(url), {
+        const response = await page.goto(ensureHttpUrl(url), {
           waitUntil: 'domcontentloaded',
           timeout: PAGE_TIMEOUT_MS
         })
         await sleep(900)
-        snapshot = await readCheckerPage(page)
+        snapshot = await readCheckerPage(page, httpResponseStatus(response) ?? 200)
         lastError = ''
       } catch (error) {
         lastError = error instanceof Error ? error.message : 'Chrome không mở được trang'
@@ -441,7 +552,7 @@ async function probeChromeUntilRenderReady(
       }
     } else {
       try {
-        snapshot = await readCheckerPage(page)
+        snapshot = await readCheckerPage(page, snapshot?.statusCode ?? 200)
       } catch {
         // Giữ snapshot cũ, lần sau sẽ tải lại.
       }
@@ -479,20 +590,14 @@ async function probeChromeUntilRenderReady(
 }
 
 async function probeChrome(
-  browser: BrowserLike,
+  page: PageLike,
   url: string,
   options?: { waitForRender?: boolean; onWaiting?: () => void }
 ): Promise<{ snapshot?: WebLinkPageSnapshot; error?: string; stillWaking?: boolean }> {
-  const page = await browser.newPage()
-  try {
-    await page.setUserAgent(DEFAULT_USER_AGENT)
-    if (options?.waitForRender) {
-      return await probeChromeUntilRenderReady(page, url, options.onWaiting)
-    }
-    return await probeChromeOnce(page, url)
-  } finally {
-    await page.close().catch(() => undefined)
+  if (options?.waitForRender) {
+    return await probeChromeUntilRenderReady(page, url, options.onWaiting)
   }
+  return await probeChromeOnce(page, url)
 }
 
 function pickAnySnapshot(
@@ -565,19 +670,40 @@ export async function checkWebLinks(
   let skipped = 0
   let done = 0
 
-  let browser: BrowserLike | null = null
+  const browsers: BrowserLike[] = []
+  const layout = chromeLayoutForLinkWeb(target === 'web' ? unique.length : 0)
+  const chromeWindows = layout.windows > 0 ? layout.windows : target === 'form' ? 1 : 0
+  const chromeTabs = layout.windows > 0 ? layout.tabsPerWindow : target === 'form' ? 1 : 0
+  const chromePath = resolveChromePath()
 
   try {
-    const httpResults = await mapPool(unique, HTTP_CONCURRENCY, async (rawUrl) => {
-      if (cancelled) {
-        return { rawUrl, snapshot: undefined as WebLinkPageSnapshot | undefined, error: 'cancelled' }
-      }
-      if (!isPublicHttpUrl(rawUrl)) {
-        return { rawUrl, snapshot: undefined, error: 'invalid' }
-      }
-      const probed = await probeHttp(rawUrl)
-      return { rawUrl, snapshot: probed.snapshot, error: probed.error }
-    })
+    if (layout.windows > 0) {
+      emitProgress({
+        done: 0,
+        total: unique.length,
+        url: '',
+        verdict: 'skipped',
+        message: `Đã đếm ${unique.length} Link_web — mở ${layout.windows} Chrome, mỗi cửa sổ ${layout.tabsPerWindow} tab`
+      })
+    }
+    const chromeLaunch = cancelled
+      ? Promise.resolve({ browsers: [] as BrowserLike[], pages: [] as PageLike[] })
+      : launchCheckerPool(chromePath, chromeWindows, chromeTabs)
+    const [httpResults, launched] = await Promise.all([
+      mapPool(unique, HTTP_CONCURRENCY, async (rawUrl) => {
+        if (cancelled) {
+          return { rawUrl, snapshot: undefined as WebLinkPageSnapshot | undefined, error: 'cancelled' }
+        }
+        if (!isPublicHttpUrl(rawUrl)) {
+          return { rawUrl, snapshot: undefined, error: 'invalid' }
+        }
+        const probed = await probeHttp(rawUrl)
+        return { rawUrl, snapshot: probed.snapshot, error: probed.error }
+      }),
+      chromeLaunch
+    ])
+    browsers.push(...launched.browsers)
+    const chromePages = launched.pages
 
     const needChrome: string[] = []
     for (const item of httpResults) {
@@ -615,24 +741,15 @@ export async function checkWebLinks(
       needChrome.push(item.rawUrl)
     }
 
-    const chromePath = resolveChromePath()
-    if (!cancelled && needChrome.length > 0 && chromePath) {
-      try {
-        browser = await openCheckerBrowser(chromePath)
-      } catch (error) {
-        console.error('[web-link] Không mở được Chrome kiểm tra', error)
-      }
-    }
-
     const httpByRaw = new Map(httpResults.map((item) => [item.rawUrl, item]))
 
-    async function inspectLegacyChrome(rawUrl: string): Promise<void> {
+    async function inspectLegacyChrome(page: PageLike | null, rawUrl: string): Promise<void> {
       if (cancelled) return
       const key = normalizeWebUrl(rawUrl)
       const httpItem = httpByRaw.get(rawUrl)
       let chromeSnap: WebLinkPageSnapshot | undefined
-      if (browser) {
-        const probed = await probeChrome(browser, rawUrl)
+      if (page) {
+        const probed = await probeChrome(page, rawUrl)
         chromeSnap = probed.snapshot
       }
       if (cancelled) return
@@ -668,15 +785,17 @@ export async function checkWebLinks(
       done += 1
     }
 
-    if (target === 'web') {
-      await mapPool(needChrome, CHROME_WEB_TAB_CONCURRENCY, async (rawUrl) => {
-        await inspectLegacyChrome(rawUrl)
-      })
-    } else {
-      for (const rawUrl of needChrome) {
-        if (cancelled) break
-        await inspectLegacyChrome(rawUrl)
+    try {
+      if (target === 'web') {
+        await runChromeWebPool(chromePages, needChrome, inspectLegacyChrome)
+      } else {
+        for (const rawUrl of needChrome) {
+          if (cancelled) break
+          await inspectLegacyChrome(chromePages[0] ?? null, rawUrl)
+        }
       }
+    } finally {
+      await closeCheckerPages(chromePages)
     }
 
     const nextText = applyWebLinkStatuses(text, statusByUrl, field)
@@ -695,13 +814,11 @@ export async function checkWebLinks(
       errors,
       skipped,
       cancelled,
-      safeBrowsingChecked: target === 'form' || needChrome.length === 0 || Boolean(browser),
+      safeBrowsingChecked: target === 'form' || needChrome.length === 0 || browsers.length > 0,
       warnings: summarizeInactiveWarnings(parseWebLinkText(nextText), reasonByUrl, field)
     }
   } finally {
-    if (browser) {
-      await browser.close().catch(() => undefined)
-    }
+    await closeCheckerBrowsers(browsers)
     running = false
   }
 }
@@ -722,19 +839,42 @@ export async function checkUrlList(
   const byKey = new Map<string, UrlProbeVerdict>()
   let done = 0
 
-  let browser: BrowserLike | null = null
+  const browsers: BrowserLike[] = []
+  const webLinkCount = uniqueItems.filter((item) => item.role === 'web').length
+  const formLinkCount = uniqueItems.filter((item) => item.role === 'form').length
+  const layout = chromeLayoutForLinkWeb(webLinkCount)
+  const chromeWindows = layout.windows > 0 ? layout.windows : formLinkCount > 0 ? 1 : 0
+  const chromeTabs = layout.windows > 0 ? layout.tabsPerWindow : formLinkCount > 0 ? 1 : 0
+  const chromePath = resolveChromePath()
 
   try {
-    const httpResults = await mapPool(unique, HTTP_CONCURRENCY, async (rawUrl) => {
-      if (cancelled) {
-        return { rawUrl, snapshot: undefined as WebLinkPageSnapshot | undefined, error: 'cancelled' }
-      }
-      if (!isPublicHttpUrl(rawUrl)) {
-        return { rawUrl, snapshot: undefined, error: 'invalid' }
-      }
-      const probed = await probeHttp(rawUrl)
-      return { rawUrl, snapshot: probed.snapshot, error: probed.error }
-    })
+    if (layout.windows > 0) {
+      emitProgress({
+        done: 0,
+        total: unique.length,
+        url: '',
+        verdict: 'skipped',
+        message: `Đã đếm ${webLinkCount} Link_web — mở ${layout.windows} Chrome, mỗi cửa sổ ${layout.tabsPerWindow} tab`
+      })
+    }
+    const chromeLaunch = cancelled
+      ? Promise.resolve({ browsers: [] as BrowserLike[], pages: [] as PageLike[] })
+      : launchCheckerPool(chromePath, chromeWindows, chromeTabs)
+    const [httpResults, launched] = await Promise.all([
+      mapPool(unique, HTTP_CONCURRENCY, async (rawUrl) => {
+        if (cancelled) {
+          return { rawUrl, snapshot: undefined as WebLinkPageSnapshot | undefined, error: 'cancelled' }
+        }
+        if (!isPublicHttpUrl(rawUrl)) {
+          return { rawUrl, snapshot: undefined, error: 'invalid' }
+        }
+        const probed = await probeHttp(rawUrl)
+        return { rawUrl, snapshot: probed.snapshot, error: probed.error }
+      }),
+      chromeLaunch
+    ])
+    browsers.push(...launched.browsers)
+    const chromePages = launched.pages
 
     const needChrome: string[] = []
     for (const item of httpResults) {
@@ -758,15 +898,16 @@ export async function checkUrlList(
         shouldWaitForRenderWake(item.snapshot as WebLinkPageSnapshot, 'render')
       if (item.snapshot && !deferRenderWake) {
         const hit = classifySnapshotToProbe(item.snapshot, role)
-        if (hit.verdict === 'error') {
+        if (hit.verdict === 'error' || hit.verdict === 'warning') {
           byKey.set(key, hit)
           done += 1
           emitProgress({
             done,
             total: unique.length,
             url: item.rawUrl,
-            verdict: 'inactive',
-            reason: knownInactiveReason(hit.errorCode)
+            verdict: hit.verdict === 'error' ? 'inactive' : 'skipped',
+            reason: knownInactiveReason(hit.errorCode),
+            message: hit.verdict === 'warning' ? hit.errorLabel : undefined
           })
           continue
         }
@@ -780,18 +921,12 @@ export async function checkUrlList(
       needChrome.push(item.rawUrl)
     }
 
-    const chromePath = resolveChromePath()
-    if (!cancelled && needChrome.length > 0 && chromePath) {
-      try {
-        browser = await openCheckerBrowser(chromePath)
-      } catch (error) {
-        console.error('[web-link] Không mở được Chrome kiểm tra', error)
-      }
-    }
+    const webUrls = needChrome.filter((rawUrl) => (roleByKey.get(normalizeWebUrl(rawUrl)) ?? 'web') === 'web')
+    const formUrls = needChrome.filter((rawUrl) => (roleByKey.get(normalizeWebUrl(rawUrl)) ?? 'web') === 'form')
 
     const httpByRaw = new Map(httpResults.map((item) => [item.rawUrl, item]))
 
-    async function inspectListChrome(rawUrl: string): Promise<void> {
+    async function inspectListChrome(page: PageLike | null, rawUrl: string): Promise<void> {
       if (cancelled) return
       const key = normalizeWebUrl(rawUrl)
       const role = roleByKey.get(key) ?? 'web'
@@ -799,9 +934,9 @@ export async function checkUrlList(
       const waitForRender = hostKind === 'render' && role === 'web'
       let chromeSnap: WebLinkPageSnapshot | undefined
       let stillWaking = false
-      if (browser) {
+      if (page) {
         const probed = await probeChrome(
-          browser,
+          page,
           rawUrl,
           waitForRender
             ? {
@@ -866,19 +1001,23 @@ export async function checkUrlList(
         done,
         total: unique.length,
         url: rawUrl,
-        verdict: hit.verdict === 'error' ? 'inactive' : 'active',
-        reason: knownInactiveReason(hit.errorCode)
+        verdict: hit.verdict === 'error' ? 'inactive' : hit.verdict === 'warning' ? 'skipped' : 'active',
+        reason: knownInactiveReason(hit.errorCode),
+        message: hit.verdict === 'warning' ? hit.errorLabel : undefined
       })
     }
 
-    const webUrls = needChrome.filter((rawUrl) => (roleByKey.get(normalizeWebUrl(rawUrl)) ?? 'web') === 'web')
-    const formUrls = needChrome.filter((rawUrl) => (roleByKey.get(normalizeWebUrl(rawUrl)) ?? 'web') === 'form')
-    await mapPool(webUrls, CHROME_WEB_TAB_CONCURRENCY, async (rawUrl) => {
-      await inspectListChrome(rawUrl)
-    })
-    for (const rawUrl of formUrls) {
-      if (cancelled) break
-      await inspectListChrome(rawUrl)
+    try {
+      await runChromeWebPool(chromePages, webUrls, inspectListChrome)
+      if (formUrls.length > 0) {
+        const formPage = chromePages[0] ?? null
+        for (const rawUrl of formUrls) {
+          if (cancelled) break
+          await inspectListChrome(formPage, rawUrl)
+        }
+      }
+    } finally {
+      await closeCheckerPages(chromePages)
     }
 
     const mapped = mapUrlListResults(lines, byKey, target, { cancelled })
@@ -891,9 +1030,7 @@ export async function checkUrlList(
       target
     }
   } finally {
-    if (browser) {
-      await browser.close().catch(() => undefined)
-    }
+    await closeCheckerBrowsers(browsers)
     running = false
   }
 }

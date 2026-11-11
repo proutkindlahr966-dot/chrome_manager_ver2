@@ -61,6 +61,8 @@ export const IPC = {
   APP_INFO: 'app:info',
   APP_CHECK_UPDATES: 'app:checkUpdates',
   APP_INSTALL_UPDATE: 'app:installUpdate',
+  APP_WIPE_PREVIEW: 'app:wipePreview',
+  APP_WIPE: 'app:wipe',
   DATA_BACKUP_EXPORT: 'data:backupExport',
   DATA_BACKUP_RESTORE: 'data:backupRestore',
   DATA_BACKUP_LIST: 'data:backupList',

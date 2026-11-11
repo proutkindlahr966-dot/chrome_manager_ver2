@@ -15,8 +15,10 @@ import {
   parseWebLinkText,
   summarizeUrlList,
   classifySnapshotToProbe,
+  chromeLayoutForLinkWeb,
   httpStatusNeedsBrowser,
   isRenderHost,
+  isRenderHttp502,
   pageLooksRenderWaking,
   clampRenderKeepAliveMinutes,
   RENDER_KEEPALIVE_INTERVAL_MS,
@@ -269,7 +271,7 @@ This service has been suspended by its owner.
     expect(shouldWaitForRenderWake(waking, 'netlify')).toBe(false)
     expect(pageLooksRenderWaking({
       finalUrl: 'https://bluebadge-ownershipvalidation.onrender.com/recaptcha',
-      statusCode: 502,
+      statusCode: 503,
       title: '',
       bodyText: '',
       html: ''
@@ -287,6 +289,31 @@ This service has been suspended by its owner.
     expect(clampRenderKeepAliveMinutes(0)).toBe(1)
     expect(clampRenderKeepAliveMinutes(30)).toBe(14)
     expect(clampRenderKeepAliveMinutes(Number.NaN)).toBe(14)
+  })
+
+  it('HTTP 502 là cảnh báo làm mới lần sau, không phải lỗi và không chờ thức dậy', () => {
+    const loading502 = {
+      finalUrl: 'https://bluebadge-ownershipvalidation.onrender.com/recaptcha',
+      statusCode: 502,
+      title: 'Render - Application loading',
+      bodyText: 'Incoming HTTP request detected ...\nService waking up ...\nApplication loading',
+      html: '<html lang="en"><head><title>Render - Application loading</title></head><body>Service waking up ... Application loading</body></html>'
+    }
+    expect(isRenderHttp502(loading502)).toBe(true)
+    expect(pageLooksRenderWaking(loading502)).toBe(false)
+    expect(shouldWaitForRenderWake(loading502, 'render')).toBe(false)
+    expect(classifySnapshotToProbe(loading502, 'web')).toEqual({
+      verdict: 'warning',
+      errorCode: 'http_502',
+      errorLabel: 'Máy chủ trả về HTTP 502 — làm mới lại lần sau'
+    })
+    expect(pageLooksRenderWaking({
+      finalUrl: 'https://bluebadge-ownershipvalidation.onrender.com/recaptcha',
+      statusCode: 502,
+      title: '',
+      bodyText: '',
+      html: ''
+    })).toBe(false)
   })
 
   it('trang bình thường là đang hoạt động', () => {
@@ -336,7 +363,7 @@ describe('url list output', () => {
     expect(out[3].url).toBe('https://a.com')
     expect(out[4].verdict).toBe('skipped')
     const summary = summarizeUrlList(out)
-    expect(summary).toEqual({ valid: 2, error: 1, skipped: 2, formError: 0, webError: 1 })
+    expect(summary).toEqual({ valid: 2, error: 1, skipped: 2, warning: 0, formError: 0, webError: 1 })
   })
 
   it('bỏ qua tiêu đề, tên nhóm và ký tự phân cách, chỉ kiểm tra URL', () => {
@@ -431,6 +458,37 @@ describe('url list output', () => {
     expect(out[0].webError).toBe(true)
   })
 
+  it('HTTP 502 là cảnh báo, không tính lỗi Link_web', () => {
+    const raw = 'https://forms.gle/a|G1|https://site.onrender.com/recaptcha'
+    const lines = parseUrlListLines(raw)
+    const out = mapUrlListResults(
+      lines,
+      new Map([
+        [normalizeWebUrl('https://forms.gle/a'), { verdict: 'valid' }],
+        [
+          normalizeWebUrl('https://site.onrender.com/recaptcha'),
+          {
+            verdict: 'warning',
+            errorCode: 'http_502',
+            errorLabel: 'Máy chủ trả về HTTP 502 — làm mới lại lần sau'
+          }
+        ]
+      ])
+    )
+    expect(out[0].verdict).toBe('warning')
+    expect(out[0].errorCode).toBe('http_502')
+    expect(out[0].webError).toBe(false)
+    expect(out[0].formError).toBe(false)
+    expect(summarizeUrlList(out)).toEqual({
+      valid: 0,
+      error: 0,
+      skipped: 0,
+      warning: 1,
+      formError: 0,
+      webError: 0
+    })
+  })
+
   it('nhận link dài viewform làm Link_form', () => {
     const raw =
       'https://docs.google.com/forms/d/e/1FAIpQLSdBY2NSYtUrOvGn-TmvpS7Q-ap2G1bcrPWfQ6YCRGWX8uv_rA/viewform|10.01_KR|https://site.netlify.app/recaptcha'
@@ -478,6 +536,14 @@ describe('url list output', () => {
     ).toBe('valid')
     expect(httpStatusNeedsBrowser(400)).toBe(true)
     expect(httpStatusNeedsBrowser(200)).toBe(false)
+  })
+
+  it('55 Link_web mở 2 Chrome, mỗi cửa sổ 10 tab', () => {
+    expect(chromeLayoutForLinkWeb(0)).toEqual({ windows: 0, tabsPerWindow: 0 })
+    expect(chromeLayoutForLinkWeb(1)).toEqual({ windows: 1, tabsPerWindow: 10 })
+    expect(chromeLayoutForLinkWeb(30)).toEqual({ windows: 1, tabsPerWindow: 10 })
+    expect(chromeLayoutForLinkWeb(31)).toEqual({ windows: 2, tabsPerWindow: 10 })
+    expect(chromeLayoutForLinkWeb(55)).toEqual({ windows: 2, tabsPerWindow: 10 })
   })
 
   it('dừng giữa chừng không tô lỗi dòng chưa kiểm tra', () => {

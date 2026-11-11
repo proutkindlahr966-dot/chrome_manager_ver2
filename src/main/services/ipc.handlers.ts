@@ -45,6 +45,7 @@ import { readDiskSpace } from '../utils/disk-space'
 import type { DiskSpaceInfo } from '../../shared/disk'
 import { createTimestampedBackup, getBackupDir, listBackups, pruneOldBackups } from '../utils/db-backup'
 import { checkAppUpdates, downloadAndInstallUpdate } from './app-update'
+import { previewAppWipe, runAppWipe } from './app-wipe.service'
 
 function applyFilters(profiles: ChromeProfile[], filters?: ProfileFilters): ChromeProfile[] {
   let result = [...profiles]
@@ -542,6 +543,8 @@ ipcMain.handle(IPC.DASHBOARD_STATS, (): DashboardStats => {
   ipcMain.handle(IPC.APP_INSTALL_UPDATE, (_e, feedUrl?: string) =>
     downloadAndInstallUpdate(feedUrl)
   )
+  ipcMain.handle(IPC.APP_WIPE_PREVIEW, () => previewAppWipe())
+  ipcMain.handle(IPC.APP_WIPE, () => runAppWipe())
 
   ipcMain.handle(IPC.DATA_BACKUP_LIST, () => listBackups())
 

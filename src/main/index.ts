@@ -1,9 +1,10 @@
-import { app, shell, BrowserWindow, screen } from 'electron'
+import { app, shell, BrowserWindow, screen, Tray, Menu, nativeImage } from 'electron'
 import { join } from 'path'
 import { fileURLToPath } from 'url'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { isSafeExternalUrl } from '../shared/external-url'
 import { registerIpcHandlers } from './services/ipc.handlers'
+import { keepRenderListRunning, renderListCanRunHidden } from './services/web-link-keepalive.service'
 import { detectChromePath, stopAllRunning } from './services/chrome.service'
 import { getDb } from './db/database'
 import { runStartupDataCleanup } from './utils/data-retention'
@@ -12,16 +13,63 @@ import { isPathInside } from './utils/path-guard'
 import { createTimestampedBackup } from './utils/db-backup'
 
 let isQuitting = false
+let allowQuit = false
+let tray: Tray | null = null
+
+function appIconPath(): string {
+  return app.isPackaged
+    ? join(process.resourcesPath, 'icon.png')
+    : join(getProjectRoot(), 'build', 'icon.png')
+}
+
+function showMainWindow(): void {
+  if (!app.isReady()) return
+  const existing = BrowserWindow.getAllWindows().find((win) => !win.isDestroyed())
+  const win = existing ?? createWindow()
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+}
+
+function ensureTray(): void {
+  if (tray && !tray.isDestroyed()) return
+  const image = nativeImage.createFromPath(appIconPath())
+  tray = new Tray(image.isEmpty() ? image : image.resize({ width: 16, height: 16 }))
+  tray.setToolTip('Chrome Manager — Danh sách Render đang chạy ẩn')
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: 'Mở Chrome Manager', click: () => showMainWindow() },
+      {
+        label: 'Thoát hẳn',
+        click: () => {
+          allowQuit = true
+          app.quit()
+        }
+      }
+    ])
+  )
+  tray.on('double-click', () => showMainWindow())
+}
+
+function hideMainWindow(): void {
+  const win = BrowserWindow.getAllWindows().find((item) => !item.isDestroyed())
+  if (!win) return
+  keepRenderListRunning()
+  win.hide()
+  ensureTray()
+  if (getDb().getSettings().closeOnExit) void stopAllRunning()
+  tray?.displayBalloon?.({
+    title: 'Danh sách Render vẫn đang chạy',
+    content: 'Lịch làm mới tiếp tục ở nền. Mở lại từ biểu tượng cạnh đồng hồ.'
+  })
+}
 
 const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
 } else {
   app.on('second-instance', () => {
-    const win = BrowserWindow.getAllWindows()[0]
-    if (!win) return
-    if (win.isMinimized()) win.restore()
-    win.focus()
+    showMainWindow()
   })
 }
 
@@ -64,7 +112,7 @@ function persistWindowState(win: BrowserWindow): void {
   })
 }
 
-function createWindow(): void {
+function createWindow(): BrowserWindow {
   const saved = getDb().getSettings().windowState
   const restore =
     saved &&
@@ -115,9 +163,12 @@ function createWindow(): void {
   }
   mainWindow.on('resize', scheduleSave)
   mainWindow.on('move', scheduleSave)
-  mainWindow.on('close', () => {
+  mainWindow.on('close', (event) => {
     if (saveTimer) clearTimeout(saveTimer)
     persistWindowState(mainWindow)
+    if (allowQuit || !renderListCanRunHidden()) return
+    event.preventDefault()
+    hideMainWindow()
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
@@ -134,6 +185,7 @@ function createWindow(): void {
   } else {
     mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
+  return mainWindow
 }
 
 if (gotLock) {
@@ -170,16 +222,23 @@ if (gotLock) {
     createWindow()
 
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+      showMainWindow()
     })
   })
 
   app.on('window-all-closed', () => {
+    if (allowQuit) return
+    if (renderListCanRunHidden()) return
     if (process.platform !== 'darwin') app.quit()
   })
 
   app.on('before-quit', async (event) => {
     if (isQuitting) return
+    if (!allowQuit && renderListCanRunHidden()) {
+      event.preventDefault()
+      hideMainWindow()
+      return
+    }
     const db = getDb()
     db.flush()
     const settings = db.getSettings()

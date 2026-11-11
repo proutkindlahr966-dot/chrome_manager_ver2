@@ -26,6 +26,7 @@ import type { ImportGroupsResult } from '../shared/group-import'
 import type { DataImportPreview, DataImportResult } from '../shared/data-import'
 import type { DiskSpaceInfo } from '../shared/disk'
 import type { DbBackupInfo, UpdateCheckResult } from '../shared/app-ops'
+import type { AppWipePlan } from '../shared/app-wipe'
 import type {
   WebLinkCheckProgress,
   WebLinkCheckResult,
@@ -145,7 +146,9 @@ const api = {
     checkUpdates: (feedUrl?: string): Promise<UpdateCheckResult> =>
       ipcRenderer.invoke(IPC.APP_CHECK_UPDATES, feedUrl),
     installUpdate: (feedUrl?: string): Promise<{ ok: true } | { ok: false; error: string }> =>
-      ipcRenderer.invoke(IPC.APP_INSTALL_UPDATE, feedUrl)
+      ipcRenderer.invoke(IPC.APP_INSTALL_UPDATE, feedUrl),
+    wipePreview: (): Promise<AppWipePlan> => ipcRenderer.invoke(IPC.APP_WIPE_PREVIEW),
+    wipe: (): Promise<{ ok: true } | { ok: false; error: string }> => ipcRenderer.invoke(IPC.APP_WIPE)
   },
   backup: {
     list: (): Promise<DbBackupInfo[]> => ipcRenderer.invoke(IPC.DATA_BACKUP_LIST),

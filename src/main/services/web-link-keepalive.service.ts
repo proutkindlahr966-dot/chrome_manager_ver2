@@ -278,6 +278,35 @@ function armFromLastRun(): void {
   schedule(overdue ? FIRST_DELAY_MS : intervalMs - (Date.now() - lastRunAt!))
 }
 
+export function renderListCanRunHidden(): boolean {
+  return auto && urls.length > 0
+}
+
+/** Đóng cửa sổ không được cắt lịch. Bật lại loại Render nếu người dùng đang xem Netlify. */
+export function keepRenderListRunning(): void {
+  if (!renderListCanRunHidden()) return
+  if (hostKind !== 'render') hostKind = 'render'
+  if (!listText.trim()) {
+    try {
+      listText = loadWebLinkLists().render.content
+    } catch {
+      listText = ''
+    }
+    if (listText.trim()) urls = extractWebUrls(listText)
+  }
+  persist()
+  if (!timer && !inCycle) armFromLastRun()
+  else emit()
+}
+
+/** Dừng lịch giữ link trước khi xoá dữ liệu. Không ghi lại file sắp bị xoá. */
+export function haltWebLinkKeepAlive(): void {
+  auto = false
+  urls = []
+  clearTimer()
+  if (!inCycle) running = false
+}
+
 export function getWebLinkKeepAliveStatus(): WebLinkKeepAliveStatus {
   return snapshot()
 }
